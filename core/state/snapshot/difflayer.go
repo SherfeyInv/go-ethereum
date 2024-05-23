@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -29,7 +30,6 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/rlp"
 	bloomfilter "github.com/holiman/bloomfilter/v2"
-	"golang.org/x/exp/slices"
 )
 
 var (
@@ -43,7 +43,7 @@ var (
 	aggregatorMemoryLimit = uint64(4 * 1024 * 1024)
 
 	// aggregatorItemLimit is an approximate number of items that will end up
-	// in the agregator layer before it's flushed out to disk. A plain account
+	// in the aggregator layer before it's flushed out to disk. A plain account
 	// weighs around 14B (+hash), a storage slot 32B (+hash), a deleted slot
 	// 0B (+hash). Slots are mostly set/unset in lockstep, so that average at
 	// 16B (+hash). All in all, the average entry seems to be 15+32=47B. Use a
