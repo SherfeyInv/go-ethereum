@@ -26,7 +26,6 @@ import (
 
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/params"
@@ -41,7 +40,7 @@ var (
 
 func simTestBackend(testAddr common.Address) *Backend {
 	return NewBackend(
-		core.GenesisAlloc{
+		types.GenesisAlloc{
 			testAddr: {Balance: big.NewInt(10000000000000000)},
 		},
 	)
@@ -52,7 +51,7 @@ func newTx(sim *Backend, key *ecdsa.PrivateKey) (*types.Transaction, error) {
 
 	// create a signed transaction to send
 	head, _ := client.HeaderByNumber(context.Background(), nil) // Should be child's, good enough
-	gasPrice := new(big.Int).Add(head.BaseFee, big.NewInt(1))
+	gasPrice := new(big.Int).Add(head.BaseFee, big.NewInt(params.GWei))
 	addr := crypto.PubkeyToAddress(key.PublicKey)
 	chainid, _ := client.ChainID(context.Background())
 	nonce, err := client.PendingNonceAt(context.Background(), addr)
@@ -62,7 +61,7 @@ func newTx(sim *Backend, key *ecdsa.PrivateKey) (*types.Transaction, error) {
 	tx := types.NewTx(&types.DynamicFeeTx{
 		ChainID:   chainid,
 		Nonce:     nonce,
-		GasTipCap: big.NewInt(1),
+		GasTipCap: big.NewInt(params.GWei),
 		GasFeeCap: gasPrice,
 		Gas:       21000,
 		To:        &addr,
@@ -71,7 +70,7 @@ func newTx(sim *Backend, key *ecdsa.PrivateKey) (*types.Transaction, error) {
 }
 
 func TestNewBackend(t *testing.T) {
-	sim := NewBackend(core.GenesisAlloc{})
+	sim := NewBackend(types.GenesisAlloc{})
 	defer sim.Close()
 
 	client := sim.Client()
@@ -94,7 +93,7 @@ func TestNewBackend(t *testing.T) {
 }
 
 func TestAdjustTime(t *testing.T) {
-	sim := NewBackend(core.GenesisAlloc{})
+	sim := NewBackend(types.GenesisAlloc{})
 	defer sim.Close()
 
 	client := sim.Client()
@@ -107,7 +106,7 @@ func TestAdjustTime(t *testing.T) {
 	block2, _ := client.BlockByNumber(context.Background(), nil)
 	prevTime := block1.Time()
 	newTime := block2.Time()
-	if newTime-prevTime != uint64(time.Minute) {
+	if newTime-prevTime != 60 {
 		t.Errorf("adjusted time not equal to 60 seconds. prev: %v, new: %v", prevTime, newTime)
 	}
 }
@@ -195,8 +194,8 @@ func TestFork(t *testing.T) {
 //  2. Send a transaction.
 //  3. Check that the TX is included in block 1.
 //  4. Fork by using the parent block as ancestor.
-//  5. Mine a block, Re-send the transaction and mine another one.
-//  6. Check that the TX is now included in block 2.
+//  5. Mine a block. We expect the out-forked tx to have trickled to the pool, and into the new block.
+//  6. Check that the TX is now included in (the new) block 1.
 func TestForkResendTx(t *testing.T) {
 	t.Parallel()
 	testAddr := crypto.PubkeyToAddress(testKey.PublicKey)
@@ -214,7 +213,9 @@ func TestForkResendTx(t *testing.T) {
 	if err != nil {
 		t.Fatalf("could not create transaction: %v", err)
 	}
-	client.SendTransaction(ctx, tx)
+	if err := client.SendTransaction(ctx, tx); err != nil {
+		t.Fatalf("sending transaction: %v", err)
+	}
 	sim.Commit()
 
 	// 3.
@@ -230,12 +231,8 @@ func TestForkResendTx(t *testing.T) {
 
 	// 5.
 	sim.Commit()
-	if err := client.SendTransaction(ctx, tx); err != nil {
-		t.Fatalf("sending transaction: %v", err)
-	}
-	sim.Commit()
 	receipt, _ = client.TransactionReceipt(ctx, tx.Hash())
-	if h := receipt.BlockNumber.Uint64(); h != 2 {
+	if h := receipt.BlockNumber.Uint64(); h != 1 {
 		t.Errorf("TX included in wrong block: %d", h)
 	}
 }
@@ -257,11 +254,10 @@ func TestCommitReturnValue(t *testing.T) {
 	}
 
 	// Create a block in the original chain (containing a transaction to force different block hashes)
-	head, _ := client.HeaderByNumber(ctx, nil) // Should be child's, good enough
-	gasPrice := new(big.Int).Add(head.BaseFee, big.NewInt(1))
-	_tx := types.NewTransaction(0, testAddr, big.NewInt(1000), params.TxGas, gasPrice, nil)
-	tx, _ := types.SignTx(_tx, types.HomesteadSigner{}, testKey)
-	client.SendTransaction(ctx, tx)
+	tx, _ := newTx(sim, testKey)
+	if err := client.SendTransaction(ctx, tx); err != nil {
+		t.Errorf("sending transaction: %v", err)
+	}
 
 	h2 := sim.Commit()
 
