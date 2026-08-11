@@ -20,13 +20,13 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/mattn/go-colorable"
-	"golang.org/x/exp/slog"
 )
 
 func TestEncryption(t *testing.T) {
@@ -48,7 +48,7 @@ func TestEncryption(t *testing.T) {
 	}
 	t.Logf("Plaintext %v\n", string(p))
 	if !bytes.Equal(plaintext, p) {
-		t.Errorf("Failed: expected plaintext recovery, got %v expected %v", string(plaintext), string(p))
+		t.Errorf("Failed: expected plaintext recovery, got %v expected %v", string(p), string(plaintext))
 	}
 }
 

@@ -19,9 +19,11 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -33,12 +35,15 @@ import (
 	"github.com/ethereum/go-ethereum/console/prompt"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/state/snapshot"
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethdb"
-	"github.com/ethereum/go-ethereum/internal/flags"
+	"github.com/ethereum/go-ethereum/ethdb/pebble"
+	"github.com/ethereum/go-ethereum/internal/tablewriter"
 	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/trie"
-	"github.com/olekukonko/tablewriter"
+	"github.com/ethereum/go-ethereum/triedb"
 	"github.com/urfave/cli/v2"
 )
 
@@ -49,7 +54,24 @@ var (
 	}
 	removeChainDataFlag = &cli.BoolFlag{
 		Name:  "remove.chain",
-		Usage: "If set, selects the state data for removal",
+		Usage: "If set, selects the chain data for removal",
+	}
+	inspectTrieTopFlag = &cli.IntFlag{
+		Name:  "top",
+		Usage: "Print the top N results per ranking category",
+		Value: 10,
+	}
+	inspectTrieDumpPathFlag = &cli.StringFlag{
+		Name:  "dump-path",
+		Usage: "Path for the trie statistics dump file",
+	}
+	inspectTrieSummarizeFlag = &cli.StringFlag{
+		Name:  "summarize",
+		Usage: "Summarize an existing trie dump file (skip trie traversal)",
+	}
+	inspectTrieContractFlag = &cli.StringFlag{
+		Name:  "contract",
+		Usage: "Inspect only the storage of the given contract address (skips full account trie walk)",
 	}
 
 	removedbCommand = &cli.Command{
@@ -57,7 +79,7 @@ var (
 		Name:      "removedb",
 		Usage:     "Remove blockchain and state databases",
 		ArgsUsage: "",
-		Flags: flags.Merge(utils.DatabaseFlags,
+		Flags: slices.Concat(utils.DatabaseFlags,
 			[]cli.Flag{removeStateDataFlag, removeChainDataFlag}),
 		Description: `
 Remove blockchain and state databases`,
@@ -72,6 +94,7 @@ Remove blockchain and state databases`,
 			dbCompactCmd,
 			dbGetCmd,
 			dbDeleteCmd,
+			dbInspectTrieCmd,
 			dbPutCmd,
 			dbGetSlotsCmd,
 			dbDumpFreezerIndex,
@@ -79,23 +102,39 @@ Remove blockchain and state databases`,
 			dbExportCmd,
 			dbMetadataCmd,
 			dbCheckStateContentCmd,
+			dbInspectHistoryCmd,
+			dbPebbleUpgradeCmd,
 		},
 	}
 	dbInspectCmd = &cli.Command{
-		Action:    inspect,
-		Name:      "inspect",
-		ArgsUsage: "<prefix> <start>",
-		Flags: flags.Merge([]cli.Flag{
-			utils.SyncModeFlag,
-		}, utils.NetworkFlags, utils.DatabaseFlags),
+		Action:      inspect,
+		Name:        "inspect",
+		ArgsUsage:   "<prefix> <start>",
+		Flags:       slices.Concat(utils.NetworkFlags, utils.DatabaseFlags),
 		Usage:       "Inspect the storage size for each type of data in the database",
 		Description: `This commands iterates the entire database. If the optional 'prefix' and 'start' arguments are provided, then the iteration is limited to the given subset of data.`,
+	}
+	dbInspectTrieCmd = &cli.Command{
+		Action:    inspectTrie,
+		Name:      "inspect-trie",
+		ArgsUsage: "<blocknum>",
+		Flags: slices.Concat([]cli.Flag{
+			utils.ExcludeStorageFlag,
+			inspectTrieTopFlag,
+			utils.OutputFileFlag,
+			inspectTrieDumpPathFlag,
+			inspectTrieSummarizeFlag,
+			inspectTrieContractFlag,
+		}, utils.NetworkFlags, utils.DatabaseFlags),
+		Usage: "Print detailed trie information about the structure of account trie and storage tries.",
+		Description: `This commands iterates the entrie trie-backed state. If the 'blocknum' is not specified, 
+the latest block number will be used by default.`,
 	}
 	dbCheckStateContentCmd = &cli.Command{
 		Action:    checkStateContent,
 		Name:      "check-state-content",
 		ArgsUsage: "<start (optional)>",
-		Flags:     flags.Merge(utils.NetworkFlags, utils.DatabaseFlags),
+		Flags:     slices.Concat(utils.NetworkFlags, utils.DatabaseFlags),
 		Usage:     "Verify that state data is cryptographically correct",
 		Description: `This command iterates the entire database for 32-byte keys, looking for rlp-encoded trie nodes.
 For each trie node encountered, it checks that the key corresponds to the keccak256(value). If this is not true, this indicates
@@ -105,16 +144,13 @@ a data corruption.`,
 		Action: dbStats,
 		Name:   "stats",
 		Usage:  "Print leveldb statistics",
-		Flags: flags.Merge([]cli.Flag{
-			utils.SyncModeFlag,
-		}, utils.NetworkFlags, utils.DatabaseFlags),
+		Flags:  slices.Concat(utils.NetworkFlags, utils.DatabaseFlags),
 	}
 	dbCompactCmd = &cli.Command{
 		Action: dbCompact,
 		Name:   "compact",
 		Usage:  "Compact leveldb database. WARNING: May take a very long time",
-		Flags: flags.Merge([]cli.Flag{
-			utils.SyncModeFlag,
+		Flags: slices.Concat([]cli.Flag{
 			utils.CacheFlag,
 			utils.CacheDatabaseFlag,
 		}, utils.NetworkFlags, utils.DatabaseFlags),
@@ -123,13 +159,11 @@ WARNING: This operation may take a very long time to finish, and may cause datab
 corruption if it is aborted during execution'!`,
 	}
 	dbGetCmd = &cli.Command{
-		Action:    dbGet,
-		Name:      "get",
-		Usage:     "Show the value of a database key",
-		ArgsUsage: "<hex-encoded key>",
-		Flags: flags.Merge([]cli.Flag{
-			utils.SyncModeFlag,
-		}, utils.NetworkFlags, utils.DatabaseFlags),
+		Action:      dbGet,
+		Name:        "get",
+		Usage:       "Show the value of a database key",
+		ArgsUsage:   "<hex-encoded key>",
+		Flags:       slices.Concat(utils.NetworkFlags, utils.DatabaseFlags),
 		Description: "This command looks up the specified database key from the database.",
 	}
 	dbDeleteCmd = &cli.Command{
@@ -137,9 +171,7 @@ corruption if it is aborted during execution'!`,
 		Name:      "delete",
 		Usage:     "Delete a database key (WARNING: may corrupt your database)",
 		ArgsUsage: "<hex-encoded key>",
-		Flags: flags.Merge([]cli.Flag{
-			utils.SyncModeFlag,
-		}, utils.NetworkFlags, utils.DatabaseFlags),
+		Flags:     slices.Concat(utils.NetworkFlags, utils.DatabaseFlags),
 		Description: `This command deletes the specified database key from the database.
 WARNING: This is a low-level operation which may cause database corruption!`,
 	}
@@ -148,60 +180,80 @@ WARNING: This is a low-level operation which may cause database corruption!`,
 		Name:      "put",
 		Usage:     "Set the value of a database key (WARNING: may corrupt your database)",
 		ArgsUsage: "<hex-encoded key> <hex-encoded value>",
-		Flags: flags.Merge([]cli.Flag{
-			utils.SyncModeFlag,
-		}, utils.NetworkFlags, utils.DatabaseFlags),
+		Flags:     slices.Concat(utils.NetworkFlags, utils.DatabaseFlags),
 		Description: `This command sets a given database key to the given value.
 WARNING: This is a low-level operation which may cause database corruption!`,
 	}
 	dbGetSlotsCmd = &cli.Command{
-		Action:    dbDumpTrie,
-		Name:      "dumptrie",
-		Usage:     "Show the storage key/values of a given storage trie",
-		ArgsUsage: "<hex-encoded state root> <hex-encoded account hash> <hex-encoded storage trie root> <hex-encoded start (optional)> <int max elements (optional)>",
-		Flags: flags.Merge([]cli.Flag{
-			utils.SyncModeFlag,
-		}, utils.NetworkFlags, utils.DatabaseFlags),
+		Action:      dbDumpTrie,
+		Name:        "dumptrie",
+		Usage:       "Show the storage key/values of a given storage trie",
+		ArgsUsage:   "<hex-encoded state root> <hex-encoded account hash> <hex-encoded storage trie root> <hex-encoded start (optional)> <int max elements (optional)>",
+		Flags:       slices.Concat(utils.NetworkFlags, utils.DatabaseFlags),
 		Description: "This command looks up the specified database key from the database.",
 	}
 	dbDumpFreezerIndex = &cli.Command{
-		Action:    freezerInspect,
-		Name:      "freezer-index",
-		Usage:     "Dump out the index of a specific freezer table",
-		ArgsUsage: "<freezer-type> <table-type> <start (int)> <end (int)>",
-		Flags: flags.Merge([]cli.Flag{
-			utils.SyncModeFlag,
-		}, utils.NetworkFlags, utils.DatabaseFlags),
+		Action:      freezerInspect,
+		Name:        "freezer-index",
+		Usage:       "Dump out the index of a specific freezer table",
+		ArgsUsage:   "<freezer-type> <table-type> <start (int)> <end (int)>",
+		Flags:       slices.Concat(utils.NetworkFlags, utils.DatabaseFlags),
 		Description: "This command displays information about the freezer index.",
 	}
 	dbImportCmd = &cli.Command{
-		Action:    importLDBdata,
-		Name:      "import",
-		Usage:     "Imports leveldb-data from an exported RLP dump.",
-		ArgsUsage: "<dumpfile> <start (optional)",
-		Flags: flags.Merge([]cli.Flag{
-			utils.SyncModeFlag,
-		}, utils.NetworkFlags, utils.DatabaseFlags),
+		Action:      importLDBdata,
+		Name:        "import",
+		Usage:       "Imports leveldb-data from an exported RLP dump.",
+		ArgsUsage:   "<dumpfile> <start (optional)",
+		Flags:       slices.Concat(utils.NetworkFlags, utils.DatabaseFlags),
 		Description: "The import command imports the specific chain data from an RLP encoded stream.",
 	}
 	dbExportCmd = &cli.Command{
-		Action:    exportChaindata,
-		Name:      "export",
-		Usage:     "Exports the chain data into an RLP dump. If the <dumpfile> has .gz suffix, gzip compression will be used.",
-		ArgsUsage: "<type> <dumpfile>",
-		Flags: flags.Merge([]cli.Flag{
-			utils.SyncModeFlag,
-		}, utils.NetworkFlags, utils.DatabaseFlags),
+		Action:      exportChaindata,
+		Name:        "export",
+		Usage:       "Exports the chain data into an RLP dump. If the <dumpfile> has .gz suffix, gzip compression will be used.",
+		ArgsUsage:   "<type> <dumpfile>",
+		Flags:       slices.Concat(utils.NetworkFlags, utils.DatabaseFlags),
 		Description: "Exports the specified chain data to an RLP encoded stream, optionally gzip-compressed.",
 	}
 	dbMetadataCmd = &cli.Command{
-		Action: showMetaData,
-		Name:   "metadata",
-		Usage:  "Shows metadata about the chain status.",
-		Flags: flags.Merge([]cli.Flag{
-			utils.SyncModeFlag,
-		}, utils.NetworkFlags, utils.DatabaseFlags),
+		Action:      showMetaData,
+		Name:        "metadata",
+		Usage:       "Shows metadata about the chain status.",
+		Flags:       slices.Concat(utils.NetworkFlags, utils.DatabaseFlags),
 		Description: "Shows metadata about the chain status.",
+	}
+	dbInspectHistoryCmd = &cli.Command{
+		Action:    inspectHistory,
+		Name:      "inspect-history",
+		Usage:     "Inspect the state history within block range",
+		ArgsUsage: "<address> [OPTIONAL <storage-slot>]",
+		Flags: slices.Concat([]cli.Flag{
+			&cli.Uint64Flag{
+				Name:  "start",
+				Usage: "block number of the range start, zero means earliest history",
+			},
+			&cli.Uint64Flag{
+				Name:  "end",
+				Usage: "block number of the range end(included), zero means latest history",
+			},
+			&cli.BoolFlag{
+				Name:  "raw",
+				Usage: "display the decoded raw state value (otherwise shows rlp-encoded value)",
+			},
+		}, utils.NetworkFlags, utils.DatabaseFlags),
+		Description: "This command queries the history of the account or storage slot within the specified block range",
+	}
+	dbPebbleUpgradeCmd = &cli.Command{
+		Action: dbPebbleUpgrade,
+		Name:   "pebble-upgrade",
+		Usage:  "Upgrade a legacy pebble v1 database to pebble v2 format",
+		Flags:  slices.Concat(utils.NetworkFlags, utils.DatabaseFlags),
+		Description: `This command upgrades a legacy Pebble v1 database so 
+that it becomes compatible with Pebble v2. The upgrade process converts the
+database format to the oldest format supported by Pebble v2. It's not the
+one-way operation, instead, the database can still be opened by older versions
+of geth that use the pebble v1 library.`,
 	}
 )
 
@@ -220,11 +272,18 @@ func removeDB(ctx *cli.Context) error {
 		ancientDir = config.Node.ResolvePath(ancientDir)
 	}
 	// Delete state data
-	statePaths := []string{rootDir, filepath.Join(ancientDir, rawdb.StateFreezerName)}
+	statePaths := []string{
+		rootDir,
+		filepath.Join(ancientDir, rawdb.MerkleStateFreezerName),
+		filepath.Join(ancientDir, rawdb.VerkleStateFreezerName),
+	}
 	confirmAndRemoveDB(statePaths, "state data", ctx, removeStateDataFlag.Name)
 
 	// Delete ancient chain
-	chainPaths := []string{filepath.Join(ancientDir, rawdb.ChainFreezerName)}
+	chainPaths := []string{filepath.Join(
+		ancientDir,
+		rawdb.ChainFreezerName,
+	)}
 	confirmAndRemoveDB(chainPaths, "ancient chain", ctx, removeChainDataFlag.Name)
 	return nil
 }
@@ -350,6 +409,7 @@ func checkStateContent(ctx *cli.Context) error {
 		startTime = time.Now()
 		lastLog   = time.Now()
 	)
+	defer it.Release()
 	for it.Next() {
 		count++
 		k := it.Key()
@@ -375,17 +435,95 @@ func checkStateContent(ctx *cli.Context) error {
 	return nil
 }
 
-func showLeveldbStats(db ethdb.KeyValueStater) {
-	if stats, err := db.Stat("leveldb.stats"); err != nil {
+func inspectTrie(ctx *cli.Context) error {
+	topN := ctx.Int(inspectTrieTopFlag.Name)
+	if topN <= 0 {
+		return fmt.Errorf("invalid --%s value %d (must be > 0)", inspectTrieTopFlag.Name, topN)
+	}
+	config := &trie.InspectConfig{
+		NoStorage: ctx.Bool(utils.ExcludeStorageFlag.Name),
+		TopN:      topN,
+		Path:      ctx.String(utils.OutputFileFlag.Name),
+	}
+
+	if summarizePath := ctx.String(inspectTrieSummarizeFlag.Name); summarizePath != "" {
+		if ctx.NArg() > 0 {
+			return fmt.Errorf("block number argument is not supported with --%s", inspectTrieSummarizeFlag.Name)
+		}
+		config.DumpPath = summarizePath
+		log.Info("Summarizing trie dump", "path", summarizePath, "top", topN)
+		return trie.Summarize(summarizePath, config)
+	}
+	if ctx.NArg() > 1 {
+		return fmt.Errorf("excessive number of arguments: %v", ctx.Command.ArgsUsage)
+	}
+
+	stack, _ := makeConfigNode(ctx)
+	db := utils.MakeChainDatabase(ctx, stack, false)
+	defer stack.Close()
+	defer db.Close()
+
+	var (
+		trieRoot common.Hash
+		hash     common.Hash
+		number   uint64
+	)
+	switch {
+	case ctx.NArg() == 0 || ctx.Args().Get(0) == "latest":
+		head := rawdb.ReadHeadHeaderHash(db)
+		n, ok := rawdb.ReadHeaderNumber(db, head)
+		if !ok {
+			return fmt.Errorf("could not load head block hash")
+		}
+		number = n
+	case ctx.Args().Get(0) == "snapshot":
+		trieRoot = rawdb.ReadSnapshotRoot(db)
+		number = math.MaxUint64
+	default:
+		var err error
+		number, err = strconv.ParseUint(ctx.Args().Get(0), 10, 64)
+		if err != nil {
+			return fmt.Errorf("failed to parse blocknum, Args[0]: %v, err: %v", ctx.Args().Get(0), err)
+		}
+	}
+
+	if number != math.MaxUint64 {
+		hash = rawdb.ReadCanonicalHash(db, number)
+		if hash == (common.Hash{}) {
+			return fmt.Errorf("canonical hash for block %d not found", number)
+		}
+		blockHeader := rawdb.ReadHeader(db, hash, number)
+		trieRoot = blockHeader.Root
+	}
+	if trieRoot == (common.Hash{}) {
+		log.Error("Empty root hash")
+	}
+
+	config.DumpPath = ctx.String(inspectTrieDumpPathFlag.Name)
+	if config.DumpPath == "" {
+		config.DumpPath = stack.ResolvePath("trie-dump.bin")
+	}
+
+	triedb := utils.MakeTrieDatabase(ctx, stack, db, false, true, false)
+	defer triedb.Close()
+
+	if contractAddr := ctx.String(inspectTrieContractFlag.Name); contractAddr != "" {
+		address := common.HexToAddress(contractAddr)
+		log.Info("Inspecting contract", "address", address, "root", trieRoot, "block", number)
+		return trie.InspectContract(triedb, db, trieRoot, address)
+	}
+
+	log.Info("Inspecting trie", "root", trieRoot, "block", number, "dump", config.DumpPath, "top", topN)
+	return trie.Inspect(triedb, trieRoot, config)
+}
+
+func showDBStats(db ethdb.KeyValueStater) {
+	stats, err := db.Stat()
+	if err != nil {
 		log.Warn("Failed to read database stats", "error", err)
-	} else {
-		fmt.Println(stats)
+		return
 	}
-	if ioStats, err := db.Stat("leveldb.iostats"); err != nil {
-		log.Warn("Failed to read database iostats", "error", err)
-	} else {
-		fmt.Println(ioStats)
-	}
+	fmt.Println(stats)
 }
 
 func dbStats(ctx *cli.Context) error {
@@ -395,7 +533,7 @@ func dbStats(ctx *cli.Context) error {
 	db := utils.MakeChainDatabase(ctx, stack, true)
 	defer db.Close()
 
-	showLeveldbStats(db)
+	showDBStats(db)
 	return nil
 }
 
@@ -407,7 +545,7 @@ func dbCompact(ctx *cli.Context) error {
 	defer db.Close()
 
 	log.Info("Stats before compaction")
-	showLeveldbStats(db)
+	showDBStats(db)
 
 	log.Info("Triggering compaction")
 	if err := db.Compact(nil, nil); err != nil {
@@ -415,8 +553,23 @@ func dbCompact(ctx *cli.Context) error {
 		return err
 	}
 	log.Info("Stats after compaction")
-	showLeveldbStats(db)
+	showDBStats(db)
 	return nil
+}
+
+func dbPebbleUpgrade(ctx *cli.Context) error {
+	stack, _ := makeConfigNode(ctx)
+	defer stack.Close()
+
+	path := stack.ResolvePath("chaindata")
+	dbType := rawdb.PreexistingDatabase(path)
+	if dbType == "" {
+		return fmt.Errorf("no database found at %s", path)
+	}
+	if dbType != rawdb.DBPebble {
+		return fmt.Errorf("database at %s is %s, not pebble", path, dbType)
+	}
+	return pebble.Upgrade(path)
 }
 
 // dbGet shows the value of a given database key
@@ -517,7 +670,7 @@ func dbDumpTrie(ctx *cli.Context) error {
 	db := utils.MakeChainDatabase(ctx, stack, true)
 	defer db.Close()
 
-	triedb := utils.MakeTrieDatabase(ctx, db, false, true, false)
+	triedb := utils.MakeTrieDatabase(ctx, stack, db, false, true, false)
 	defer triedb.Close()
 
 	var (
@@ -682,6 +835,24 @@ func (iter *snapshotIterator) Release() {
 	iter.storage.Release()
 }
 
+type codeIterator struct {
+	iter ethdb.Iterator
+}
+
+func (iter *codeIterator) Next() (byte, []byte, []byte, bool) {
+	for iter.iter.Next() {
+		key := iter.iter.Key()
+		if bytes.HasPrefix(key, rawdb.CodePrefix) && len(key) == (len(rawdb.CodePrefix)+common.HashLength) {
+			return utils.OpBatchAdd, key, iter.iter.Value(), true
+		}
+	}
+	return 0, nil, nil, false
+}
+
+func (iter *codeIterator) Release() {
+	iter.iter.Release()
+}
+
 // chainExporters defines the export scheme for all exportable chain data.
 var chainExporters = map[string]func(db ethdb.Database) utils.ChainDataIterator{
 	"preimage": func(db ethdb.Database) utils.ChainDataIterator {
@@ -692,6 +863,10 @@ var chainExporters = map[string]func(db ethdb.Database) utils.ChainDataIterator{
 		account := db.NewIterator(rawdb.SnapshotAccountPrefix, nil)
 		storage := db.NewIterator(rawdb.SnapshotStoragePrefix, nil)
 		return &snapshotIterator{account: account, storage: storage}
+	},
+	"code": func(db ethdb.Database) utils.ChainDataIterator {
+		iter := db.NewIterator(rawdb.CodePrefix, nil)
+		return &codeIterator{iter: iter}
 	},
 }
 
@@ -758,4 +933,145 @@ func showMetaData(ctx *cli.Context) error {
 	table.AppendBulk(data)
 	table.Render()
 	return nil
+}
+
+func inspectAccount(db *triedb.Database, start uint64, end uint64, address common.Address, raw bool) error {
+	stats, err := db.AccountHistory(address, start, end)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Account history:\n\taddress: %s\n\tblockrange: [#%d-#%d]\n", address.Hex(), stats.Start, stats.End)
+
+	from := stats.Start
+	for i := 0; i < len(stats.Blocks); i++ {
+		var content string
+		if len(stats.Origins[i]) == 0 {
+			content = "<empty>"
+		} else {
+			if !raw {
+				content = fmt.Sprintf("%#x", stats.Origins[i])
+			} else {
+				account := new(types.SlimAccount)
+				if err := rlp.DecodeBytes(stats.Origins[i], account); err != nil {
+					panic(err)
+				}
+				code := "<nil>"
+				if len(account.CodeHash) > 0 {
+					code = fmt.Sprintf("%#x", account.CodeHash)
+				}
+				root := "<nil>"
+				if len(account.Root) > 0 {
+					root = fmt.Sprintf("%#x", account.Root)
+				}
+				content = fmt.Sprintf("nonce: %d, balance: %d, codeHash: %s, root: %s", account.Nonce, account.Balance, code, root)
+			}
+		}
+		fmt.Printf("#%d - #%d: %s\n", from, stats.Blocks[i], content)
+		from = stats.Blocks[i]
+	}
+	return nil
+}
+
+func inspectStorage(db *triedb.Database, start uint64, end uint64, address common.Address, slot common.Hash, raw bool) error {
+	// The hash of storage slot key is utilized in the history
+	// rather than the raw slot key, make the conversion.
+	stats, err := db.StorageHistory(address, slot, start, end)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Storage history:\n\taddress: %s\n\tslot: %s\n\tblockrange: [#%d-#%d]\n", address.Hex(), slot.Hex(), stats.Start, stats.End)
+
+	from := stats.Start
+	for i := 0; i < len(stats.Blocks); i++ {
+		var content string
+		if len(stats.Origins[i]) == 0 {
+			content = "<empty>"
+		} else {
+			if !raw {
+				content = fmt.Sprintf("%#x", stats.Origins[i])
+			} else {
+				_, data, _, err := rlp.Split(stats.Origins[i])
+				if err != nil {
+					fmt.Printf("Failed to decode storage slot, %v", err)
+					return err
+				}
+				content = fmt.Sprintf("%#x", data)
+			}
+		}
+		fmt.Printf("#%d - #%d: %s\n", from, stats.Blocks[i], content)
+		from = stats.Blocks[i]
+	}
+	return nil
+}
+
+func inspectHistory(ctx *cli.Context) error {
+	if ctx.NArg() == 0 || ctx.NArg() > 2 {
+		return fmt.Errorf("required arguments: %v", ctx.Command.ArgsUsage)
+	}
+	var (
+		address common.Address
+		slot    common.Hash
+	)
+	if err := address.UnmarshalText([]byte(ctx.Args().Get(0))); err != nil {
+		return err
+	}
+	if ctx.NArg() > 1 {
+		if err := slot.UnmarshalText([]byte(ctx.Args().Get(1))); err != nil {
+			return err
+		}
+	}
+	// Load the databases.
+	stack, _ := makeConfigNode(ctx)
+	defer stack.Close()
+
+	db := utils.MakeChainDatabase(ctx, stack, true)
+	defer db.Close()
+
+	triedb := utils.MakeTrieDatabase(ctx, stack, db, false, false, false)
+	defer triedb.Close()
+
+	var (
+		err   error
+		start uint64 // the id of first history object to query
+		end   uint64 // the id (included) of last history object to query
+	)
+	// State histories are identified by state ID rather than block number.
+	// To address this, load the corresponding block header and perform the
+	// conversion by this function.
+	blockToID := func(blockNumber uint64) (uint64, error) {
+		header := rawdb.ReadHeader(db, rawdb.ReadCanonicalHash(db, blockNumber), blockNumber)
+		if header == nil {
+			return 0, fmt.Errorf("block #%d is not existent", blockNumber)
+		}
+		id := rawdb.ReadStateID(db, header.Root)
+		if id == nil {
+			first, last, err := triedb.HistoryRange()
+			if err == nil {
+				return 0, fmt.Errorf("history of block #%d is not existent, available history range: [#%d-#%d]", blockNumber, first, last)
+			}
+			return 0, fmt.Errorf("history of block #%d is not existent", blockNumber)
+		}
+		return *id, nil
+	}
+	// Parse the starting block number for inspection.
+	startNumber := ctx.Uint64("start")
+	if startNumber != 0 {
+		start, err = blockToID(startNumber)
+		if err != nil {
+			return err
+		}
+	}
+	// Parse the ending block number for inspection.
+	endBlock := ctx.Uint64("end")
+	if endBlock != 0 {
+		end, err = blockToID(endBlock)
+		if err != nil {
+			return err
+		}
+	}
+	// Inspect the state history.
+	if slot == (common.Hash{}) {
+		return inspectAccount(triedb, start, end, address, ctx.Bool("raw"))
+	}
+	return inspectStorage(triedb, start, end, address, slot, ctx.Bool("raw"))
 }

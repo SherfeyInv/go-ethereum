@@ -19,10 +19,10 @@ package eth
 import (
 	"errors"
 	"fmt"
-	"math/big"
+	"maps"
+	"slices"
 	"sync"
 
-	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/eth/protocols/eth"
 	"github.com/ethereum/go-ethereum/eth/protocols/snap"
 	"github.com/ethereum/go-ethereum/p2p"
@@ -49,8 +49,7 @@ var (
 // peerSet represents the collection of active peers currently participating in
 // the `eth` protocol, with or without the `snap` extension.
 type peerSet struct {
-	peers     map[string]*ethPeer // Peers connected on the `eth` protocol
-	snapPeers int                 // Number of `snap` compatible peers for connection prioritization
+	peers map[string]*ethPeer // Peers connected on the `eth` protocol
 
 	snapWait map[string]chan *snap.Peer // Peers connected on `eth` waiting for their snap extension
 	snapPend map[string]*snap.Peer      // Peers connected on the `snap` protocol, but not yet on `eth`
@@ -100,7 +99,7 @@ func (ps *peerSet) registerSnapExtension(peer *snap.Peer) error {
 	return nil
 }
 
-// waitExtensions blocks until all satellite protocols are connected and tracked
+// waitSnapExtension blocks until all satellite protocols are connected and tracked
 // by the peerset.
 func (ps *peerSet) waitSnapExtension(peer *eth.Peer) (*snap.Peer, error) {
 	// If the peer does not support a compatible `snap`, don't wait
@@ -161,7 +160,6 @@ func (ps *peerSet) registerPeer(peer *eth.Peer, ext *snap.Peer) error {
 	}
 	if ext != nil {
 		eth.snapExt = &snapPeer{ext}
-		ps.snapPeers++
 	}
 	ps.peers[id] = eth
 	return nil
@@ -173,14 +171,10 @@ func (ps *peerSet) unregisterPeer(id string) error {
 	ps.lock.Lock()
 	defer ps.lock.Unlock()
 
-	peer, ok := ps.peers[id]
-	if !ok {
+	if _, ok := ps.peers[id]; !ok {
 		return errPeerNotRegistered
 	}
 	delete(ps.peers, id)
-	if peer.snapExt != nil {
-		ps.snapPeers--
-	}
 	return nil
 }
 
@@ -192,34 +186,12 @@ func (ps *peerSet) peer(id string) *ethPeer {
 	return ps.peers[id]
 }
 
-// peersWithoutBlock retrieves a list of peers that do not have a given block in
-// their set of known hashes so it might be propagated to them.
-func (ps *peerSet) peersWithoutBlock(hash common.Hash) []*ethPeer {
+// all returns all current peers.
+func (ps *peerSet) all() []*ethPeer {
 	ps.lock.RLock()
 	defer ps.lock.RUnlock()
 
-	list := make([]*ethPeer, 0, len(ps.peers))
-	for _, p := range ps.peers {
-		if !p.KnownBlock(hash) {
-			list = append(list, p)
-		}
-	}
-	return list
-}
-
-// peersWithoutTransaction retrieves a list of peers that do not have a given
-// transaction in their set of known hashes.
-func (ps *peerSet) peersWithoutTransaction(hash common.Hash) []*ethPeer {
-	ps.lock.RLock()
-	defer ps.lock.RUnlock()
-
-	list := make([]*ethPeer, 0, len(ps.peers))
-	for _, p := range ps.peers {
-		if !p.KnownTransaction(hash) {
-			list = append(list, p)
-		}
-	}
-	return list
+	return slices.Collect(maps.Values(ps.peers))
 }
 
 // len returns if the current number of `eth` peers in the set. Since the `snap`
@@ -232,30 +204,21 @@ func (ps *peerSet) len() int {
 	return len(ps.peers)
 }
 
-// snapLen returns if the current number of `snap` peers in the set.
-func (ps *peerSet) snapLen() int {
+// snapLen returns the number of `snap` peers whose negotiated version is at
+// least minVersion — i.e. peers usable by a state syncer running that version.
+// Lower-version snap peers (which the node still serves but cannot sync from)
+// are excluded, so they don't get counted toward the reserved snap-peer slots.
+func (ps *peerSet) snapLen(minVersion uint) int {
 	ps.lock.RLock()
 	defer ps.lock.RUnlock()
 
-	return ps.snapPeers
-}
-
-// peerWithHighestTD retrieves the known peer with the currently highest total
-// difficulty, but below the given PoS switchover threshold.
-func (ps *peerSet) peerWithHighestTD() *eth.Peer {
-	ps.lock.RLock()
-	defer ps.lock.RUnlock()
-
-	var (
-		bestPeer *eth.Peer
-		bestTd   *big.Int
-	)
+	var n int
 	for _, p := range ps.peers {
-		if _, td := p.Head(); bestPeer == nil || td.Cmp(bestTd) > 0 {
-			bestPeer, bestTd = p.Peer, td
+		if p.snapExt != nil && p.snapExt.Version() >= minVersion {
+			n++
 		}
 	}
-	return bestPeer
+	return n
 }
 
 // close disconnects all peers.

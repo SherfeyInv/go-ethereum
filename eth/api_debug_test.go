@@ -18,23 +18,76 @@ package eth
 
 import (
 	"bytes"
+	"crypto/ecdsa"
 	"fmt"
+	"math/big"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/davecgh/go-spew/spew"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/consensus/beacon"
+	"github.com/ethereum/go-ethereum/consensus/ethash"
+	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/state"
+	"github.com/ethereum/go-ethereum/core/tracing"
+	"github.com/ethereum/go-ethereum/core/txpool"
+	"github.com/ethereum/go-ethereum/core/txpool/blobpool"
+	"github.com/ethereum/go-ethereum/core/txpool/legacypool"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
-	"github.com/ethereum/go-ethereum/trie"
+	"github.com/ethereum/go-ethereum/params"
+	"github.com/ethereum/go-ethereum/triedb"
 	"github.com/holiman/uint256"
-	"golang.org/x/exp/slices"
+	"github.com/stretchr/testify/assert"
 )
 
 var dumper = spew.ConfigState{Indent: "    "}
+
+type Account struct {
+	key  *ecdsa.PrivateKey
+	addr common.Address
+}
+
+func newAccounts(n int) (accounts []Account) {
+	for i := 0; i < n; i++ {
+		key, _ := crypto.GenerateKey()
+		addr := crypto.PubkeyToAddress(key.PublicKey)
+		accounts = append(accounts, Account{key: key, addr: addr})
+	}
+	slices.SortFunc(accounts, func(a, b Account) int { return a.addr.Cmp(b.addr) })
+	return accounts
+}
+
+// newTestBlockChain creates a new test blockchain. OBS: After test is done, teardown must be
+// invoked in order to release associated resources.
+func newTestBlockChain(t *testing.T, n int, gspec *core.Genesis, generator func(i int, b *core.BlockGen)) *core.BlockChain {
+	engine := ethash.NewFaker()
+	// Generate blocks for testing
+	_, blocks, _ := core.GenerateChainWithGenesis(gspec, engine, n, generator)
+
+	// Import the canonical chain
+	options := &core.BlockChainConfig{
+		TrieCleanLimit: 256,
+		TrieDirtyLimit: 256,
+		TrieTimeLimit:  5 * time.Minute,
+		SnapshotLimit:  0,
+		Preimages:      true,
+		ArchiveMode:    true, // Archive mode
+	}
+	chain, err := core.NewBlockChain(rawdb.NewMemoryDatabase(), gspec, engine, options)
+	if err != nil {
+		t.Fatalf("failed to create tester chain: %v", err)
+	}
+	if n, err := chain.InsertChain(blocks); err != nil {
+		t.Fatalf("block %d: failed to insert into chain: %v", n, err)
+	}
+	return chain
+}
 
 func accountRangeTest(t *testing.T, trie *state.Trie, statedb *state.StateDB, start common.Hash, requestedNum int, expectedNum int) state.Dump {
 	result := statedb.RawDump(&state.DumpConfig{
@@ -63,8 +116,9 @@ func TestAccountRange(t *testing.T) {
 	t.Parallel()
 
 	var (
-		statedb = state.NewDatabaseWithConfig(rawdb.NewMemoryDatabase(), &trie.Config{Preimages: true})
-		sdb, _  = state.New(types.EmptyRootHash, statedb, nil)
+		mdb     = rawdb.NewMemoryDatabase()
+		statedb = state.NewDatabase(triedb.NewDatabase(mdb, &triedb.Config{Preimages: true}), nil)
+		sdb, _  = state.New(types.EmptyRootHash, statedb)
 		addrs   = [AccountRangeMaxResults * 2]common.Address{}
 		m       = map[common.Address]bool{}
 	)
@@ -73,15 +127,15 @@ func TestAccountRange(t *testing.T) {
 		hash := common.HexToHash(fmt.Sprintf("%x", i))
 		addr := common.BytesToAddress(crypto.Keccak256Hash(hash.Bytes()).Bytes())
 		addrs[i] = addr
-		sdb.SetBalance(addrs[i], uint256.NewInt(1))
+		sdb.SetBalance(addrs[i], uint256.NewInt(1), tracing.BalanceChangeUnspecified)
 		if _, ok := m[addr]; ok {
 			t.Fatalf("bad")
 		} else {
 			m[addr] = true
 		}
 	}
-	root, _ := sdb.Commit(0, true)
-	sdb, _ = state.New(root, statedb, nil)
+	root, _ := sdb.Commit(0, true, false)
+	sdb, _ = state.New(root, statedb)
 
 	trie, err := statedb.OpenTrie(root)
 	if err != nil {
@@ -134,12 +188,12 @@ func TestEmptyAccountRange(t *testing.T) {
 	t.Parallel()
 
 	var (
-		statedb = state.NewDatabase(rawdb.NewMemoryDatabase())
-		st, _   = state.New(types.EmptyRootHash, statedb, nil)
+		statedb = state.NewDatabaseForTesting()
+		st, _   = state.New(types.EmptyRootHash, statedb)
 	)
 	// Commit(although nothing to flush) and re-init the statedb
-	st.Commit(0, true)
-	st, _ = state.New(types.EmptyRootHash, statedb, nil)
+	st.Commit(0, true, false)
+	st, _ = state.New(types.EmptyRootHash, statedb)
 
 	results := st.RawDump(&state.DumpConfig{
 		SkipCode:          true,
@@ -160,8 +214,10 @@ func TestStorageRangeAt(t *testing.T) {
 
 	// Create a state where account 0x010000... has a few storage entries.
 	var (
-		db     = state.NewDatabaseWithConfig(rawdb.NewMemoryDatabase(), &trie.Config{Preimages: true})
-		sdb, _ = state.New(types.EmptyRootHash, db, nil)
+		mdb    = rawdb.NewMemoryDatabase()
+		tdb    = triedb.NewDatabase(mdb, &triedb.Config{Preimages: true})
+		db     = state.NewDatabase(tdb, nil)
+		sdb, _ = state.New(types.EmptyRootHash, db)
 		addr   = common.Address{0x01}
 		keys   = []common.Hash{ // hashes of Keys of storage
 			common.HexToHash("340dd630ad21bf010b4e676dbfa9ba9a02175262d1fa356232cfde6cb5b47ef2"),
@@ -179,8 +235,8 @@ func TestStorageRangeAt(t *testing.T) {
 	for _, entry := range storage {
 		sdb.SetState(addr, *entry.Key, entry.Value)
 	}
-	root, _ := sdb.Commit(0, false)
-	sdb, _ = state.New(root, db, nil)
+	root, _ := sdb.Commit(0, false, false)
+	sdb, _ = state.New(root, db)
 
 	// Check a few combinations of limit and start/end.
 	tests := []struct {
@@ -219,4 +275,134 @@ func TestStorageRangeAt(t *testing.T) {
 				test.start, test.limit, dumper.Sdump(result), dumper.Sdump(&test.want))
 		}
 	}
+}
+
+func TestGetModifiedAccounts(t *testing.T) {
+	t.Parallel()
+
+	// Initialize test accounts
+	accounts := newAccounts(4)
+	genesis := &core.Genesis{
+		Config: params.TestChainConfig,
+		Alloc: types.GenesisAlloc{
+			accounts[0].addr: {Balance: big.NewInt(params.Ether)},
+			accounts[1].addr: {Balance: big.NewInt(params.Ether)},
+			accounts[2].addr: {Balance: big.NewInt(params.Ether)},
+			accounts[3].addr: {Balance: big.NewInt(params.Ether)},
+		},
+	}
+	genBlocks := 1
+	signer := types.HomesteadSigner{}
+	blockChain := newTestBlockChain(t, genBlocks, genesis, func(_ int, b *core.BlockGen) {
+		// Transfer from account[0] to account[1]
+		//    value: 1000 wei
+		//    fee:   0 wei
+		for _, account := range accounts[:3] {
+			tx, _ := types.SignTx(types.NewTx(&types.LegacyTx{
+				Nonce:    0,
+				To:       &accounts[3].addr,
+				Value:    big.NewInt(1000),
+				Gas:      params.TxGas,
+				GasPrice: b.BaseFee(),
+				Data:     nil}),
+				signer, account.key)
+			b.AddTx(tx)
+		}
+	})
+	defer blockChain.Stop()
+
+	// Create a debug API instance.
+	api := NewDebugAPI(&Ethereum{blockchain: blockChain})
+
+	// Test GetModifiedAccountsByNumber
+	t.Run("GetModifiedAccountsByNumber", func(t *testing.T) {
+		addrs, err := api.GetModifiedAccountsByNumber(uint64(genBlocks), nil)
+		assert.NoError(t, err)
+		assert.Len(t, addrs, len(accounts)+1) // +1 for the coinbase
+		for _, account := range accounts {
+			if !slices.Contains(addrs, account.addr) {
+				t.Fatalf("account %s not found in modified accounts", account.addr.Hex())
+			}
+		}
+	})
+
+	// Test GetModifiedAccountsByHash
+	t.Run("GetModifiedAccountsByHash", func(t *testing.T) {
+		header := blockChain.GetHeaderByNumber(uint64(genBlocks))
+		addrs, err := api.GetModifiedAccountsByHash(header.Hash(), nil)
+		assert.NoError(t, err)
+		assert.Len(t, addrs, len(accounts)+1) // +1 for the coinbase
+		for _, account := range accounts {
+			if !slices.Contains(addrs, account.addr) {
+				t.Fatalf("account %s not found in modified accounts", account.addr.Hex())
+			}
+		}
+	})
+}
+
+func TestDebugAPI_ClearTxpool(t *testing.T) {
+	// Create test key and genesis
+	testKey, _ := crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
+	testAddress := crypto.PubkeyToAddress(testKey.PublicKey)
+	testFunds := big.NewInt(1000_000_000_000_000)
+	testGspec := &core.Genesis{
+		Config: params.MergedTestChainConfig,
+		Alloc: types.GenesisAlloc{
+			testAddress: {Balance: testFunds},
+		},
+		Difficulty: common.Big0,
+		BaseFee:    big.NewInt(params.InitialBaseFee),
+	}
+	testSigner := types.LatestSignerForChainID(testGspec.Config.ChainID)
+
+	// Initialize backend
+	db := rawdb.NewMemoryDatabase()
+	engine := beacon.New(ethash.NewFaker())
+	chain, _ := core.NewBlockChain(db, testGspec, engine, nil)
+
+	txconfig := legacypool.DefaultConfig
+	txconfig.Journal = "" // Don't litter the disk with test journals
+
+	blobPool := blobpool.New(blobpool.Config{Datadir: ""}, chain, nil)
+	legacyPool := legacypool.New(txconfig, chain)
+	pool, _ := txpool.New(txconfig.PriceLimit, chain, []txpool.SubPool{legacyPool, blobPool})
+
+	eth := &Ethereum{
+		blockchain: chain,
+		txPool:     pool,
+	}
+
+	// Create debug API
+	api := NewDebugAPI(eth)
+
+	// Create and add a test transaction
+	tx := types.NewTransaction(0, common.Address{1}, big.NewInt(1000), params.TxGas, big.NewInt(params.InitialBaseFee), nil)
+	signedTx, err := types.SignTx(tx, testSigner, testKey)
+	if err != nil {
+		t.Fatalf("Failed to sign transaction: %v", err)
+	}
+
+	// Add transaction to pool
+	errs := pool.Add([]*types.Transaction{signedTx}, true)
+	if errs[0] != nil {
+		t.Logf("Note: Transaction addition returned: %v (this may be expected)", errs[0])
+	}
+
+	// Verify we tried to add a transaction
+	t.Logf("Transaction added to pool from: %s", testAddress.Hex())
+
+	// Clear the transaction pool
+	err = api.ClearTxpool()
+	if err != nil {
+		t.Fatalf("ClearTxpool failed: %v", err)
+	}
+
+	// Verify the pool is empty after clear
+	pool.Sync()
+	pending, _ := pool.Pending(txpool.PendingFilter{})
+	if len(pending) > 0 {
+		t.Errorf("Expected empty pool after clear, but found %d accounts with pending transactions", len(pending))
+	}
+
+	t.Log("Successfully cleared transaction pool")
 }

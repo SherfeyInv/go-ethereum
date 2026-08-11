@@ -50,6 +50,10 @@ var (
 		Name:  "trace.returndata",
 		Usage: "Enable return data output in traces",
 	}
+	TraceEnableCallFramesFlag = &cli.BoolFlag{
+		Name:  "trace.callframes",
+		Usage: "Enable call frames output in traces",
+	}
 	OutputBasedir = &cli.StringFlag{
 		Name:  "output.basedir",
 		Usage: "Specifies where output files are placed. Will be created if it does not exist.",
@@ -83,6 +87,14 @@ var (
 			"\t`stderr` - into the stderr output\n" +
 			"\t<file> - into the file <file> ",
 		Value: "block.json",
+	}
+	OutputBTFlag = &cli.StringFlag{
+		Name: "output.vkt",
+		Usage: "Determines where to put the `BT` of the post-state.\n" +
+			"\t`stdout` - into the stdout output\n" +
+			"\t`stderr` - into the stderr output\n" +
+			"\t<file> - into the file <file> ",
+		Value: "vkt.json",
 	}
 	InputAllocFlag = &cli.StringFlag{
 		Name:  "input.alloc",
@@ -119,6 +131,11 @@ var (
 		Usage: "`stdin` or file name of where to find the transactions list in RLP form.",
 		Value: "txs.rlp",
 	}
+	// TODO(@CPerezz): rename `Name` of the file in a follow-up PR (relays on EEST -> https://github.com/ethereum/execution-spec-tests/tree/verkle/main)
+	InputBTFlag = &cli.StringFlag{
+		Name:  "input.vkt",
+		Usage: "`stdin` or file name of where to find the prestate BT.",
+	}
 	SealCliqueFlag = &cli.StringFlag{
 		Name:  "seal.clique",
 		Usage: "Seal block with Clique. `stdin` or file name of where to find the Clique sealing data.",
@@ -144,6 +161,11 @@ var (
 			strings.Join(tests.AvailableForks(), "\n\t    "),
 			strings.Join(vm.ActivateableEips(), ", ")),
 		Value: "GrayGlacier",
+	}
+	OpcodeCountFlag = &cli.StringFlag{
+		Name:  "opcode.count",
+		Usage: "If set, opcode execution counts will be written to this file (relative to output.basedir).",
+		Value: "",
 	}
 	VerbosityFlag = &cli.IntFlag{
 		Name:  "verbosity",

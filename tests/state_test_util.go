@@ -28,22 +28,24 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/common/math"
+	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/misc/eip4844"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/state/snapshot"
+	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/crypto/keccak"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
-	"github.com/ethereum/go-ethereum/trie"
-	"github.com/ethereum/go-ethereum/trie/triedb/hashdb"
-	"github.com/ethereum/go-ethereum/trie/triedb/pathdb"
+	"github.com/ethereum/go-ethereum/triedb"
+	"github.com/ethereum/go-ethereum/triedb/hashdb"
+	"github.com/ethereum/go-ethereum/triedb/pathdb"
 	"github.com/holiman/uint256"
-	"golang.org/x/crypto/sha3"
 )
 
 // StateTest checks transaction processing without block context.
@@ -64,7 +66,7 @@ func (t *StateTest) UnmarshalJSON(in []byte) error {
 
 type stJSON struct {
 	Env  stEnv                    `json:"env"`
-	Pre  core.GenesisAlloc        `json:"pre"`
+	Pre  types.GenesisAlloc       `json:"pre"`
 	Tx   stTransaction            `json:"transaction"`
 	Out  hexutil.Bytes            `json:"out"`
 	Post map[string][]stPostState `json:"post"`
@@ -93,6 +95,7 @@ type stEnv struct {
 	Timestamp     uint64         `json:"currentTimestamp"     gencodec:"required"`
 	BaseFee       *big.Int       `json:"currentBaseFee"       gencodec:"optional"`
 	ExcessBlobGas *uint64        `json:"currentExcessBlobGas" gencodec:"optional"`
+	SlotNumber    *uint64        `json:"slotNumber"           gencodec:"optional"`
 }
 
 type stEnvMarshaling struct {
@@ -104,6 +107,7 @@ type stEnvMarshaling struct {
 	Timestamp     math.HexOrDecimal64
 	BaseFee       *math.HexOrDecimal256
 	ExcessBlobGas *math.HexOrDecimal64
+	SlotNumber    *math.HexOrDecimal64
 }
 
 //go:generate go run github.com/fjl/gencodec -type stTransaction -field-override stTransactionMarshaling -out gen_sttransaction.go
@@ -112,7 +116,7 @@ type stTransaction struct {
 	GasPrice             *big.Int            `json:"gasPrice"`
 	MaxFeePerGas         *big.Int            `json:"maxFeePerGas"`
 	MaxPriorityFeePerGas *big.Int            `json:"maxPriorityFeePerGas"`
-	Nonce                uint64              `json:"nonce"`
+	Nonce                *big.Int            `json:"nonce"`
 	To                   string              `json:"to"`
 	Data                 []string            `json:"data"`
 	AccessLists          []*types.AccessList `json:"accessLists,omitempty"`
@@ -122,16 +126,38 @@ type stTransaction struct {
 	Sender               *common.Address     `json:"sender"`
 	BlobVersionedHashes  []common.Hash       `json:"blobVersionedHashes,omitempty"`
 	BlobGasFeeCap        *big.Int            `json:"maxFeePerBlobGas,omitempty"`
+	AuthorizationList    []*stAuthorization  `json:"authorizationList,omitempty"`
 }
 
 type stTransactionMarshaling struct {
 	GasPrice             *math.HexOrDecimal256
 	MaxFeePerGas         *math.HexOrDecimal256
 	MaxPriorityFeePerGas *math.HexOrDecimal256
-	Nonce                math.HexOrDecimal64
+	Nonce                *math.HexOrDecimal256
 	GasLimit             []math.HexOrDecimal64
 	PrivateKey           hexutil.Bytes
 	BlobGasFeeCap        *math.HexOrDecimal256
+}
+
+//go:generate go run github.com/fjl/gencodec -type stAuthorization -field-override stAuthorizationMarshaling -out gen_stauthorization.go
+
+// Authorization is an authorization from an account to deploy code at it's address.
+type stAuthorization struct {
+	ChainID *big.Int       `json:"chainId" gencodec:"required"`
+	Address common.Address `json:"address" gencodec:"required"`
+	Nonce   uint64         `json:"nonce" gencodec:"required"`
+	V       uint8          `json:"v" gencodec:"required"`
+	R       *big.Int       `json:"r" gencodec:"required"`
+	S       *big.Int       `json:"s" gencodec:"required"`
+}
+
+// field type overrides for gencodec
+type stAuthorizationMarshaling struct {
+	ChainID *math.HexOrDecimal256
+	Nonce   math.HexOrDecimal64
+	V       math.HexOrDecimal64
+	R       *math.HexOrDecimal256
+	S       *math.HexOrDecimal256
 }
 
 // GetChainConfig takes a fork definition and returns a chain config.
@@ -149,7 +175,7 @@ func GetChainConfig(forkString string) (baseConfig *params.ChainConfig, eips []i
 	}
 	for _, eip := range eipsStrings {
 		if eipNum, err := strconv.Atoi(eip); err != nil {
-			return nil, nil, fmt.Errorf("syntax error, invalid eip number %v", eipNum)
+			return nil, nil, fmt.Errorf("syntax error, invalid eip number %v", eip)
 		} else {
 			if !vm.ValidEip(eipNum) {
 				return nil, nil, fmt.Errorf("syntax error, invalid eip number %v", eipNum)
@@ -194,20 +220,14 @@ func (t *StateTest) checkError(subtest StateSubtest, err error) error {
 }
 
 // Run executes a specific subtest and verifies the post-state and logs
-func (t *StateTest) Run(subtest StateSubtest, vmconfig vm.Config, snapshotter bool, scheme string, postCheck func(err error, snaps *snapshot.Tree, state *state.StateDB)) (result error) {
-	triedb, snaps, statedb, root, err := t.RunNoVerify(subtest, vmconfig, snapshotter, scheme)
-
+func (t *StateTest) Run(subtest StateSubtest, vmconfig vm.Config, snapshotter bool, scheme string, postCheck func(err error, st *StateTestState)) (result error) {
+	st, root, _, err := t.RunNoVerify(subtest, vmconfig, snapshotter, scheme)
 	// Invoke the callback at the end of function for further analysis.
 	defer func() {
-		postCheck(result, snaps, statedb)
-
-		if triedb != nil {
-			triedb.Close()
-		}
-		if snaps != nil {
-			snaps.Release()
-		}
+		postCheck(result, &st)
+		st.Close()
 	}()
+
 	checkedErr := t.checkError(subtest, err)
 	if checkedErr != nil {
 		return checkedErr
@@ -216,6 +236,20 @@ func (t *StateTest) Run(subtest StateSubtest, vmconfig vm.Config, snapshotter bo
 	if err != nil {
 		// Here, an error exists but it was expected.
 		// We do not check the post state or logs.
+		// However, if the test defines a post state root, we should check it.
+		// In case of an error, the state is reverted to the snapshot, so we need to
+		// recalculate the root.
+		post := t.json.Post[subtest.Fork][subtest.Index]
+		if post.Root != (common.UnprefixedHash{}) {
+			config, _, err := GetChainConfig(subtest.Fork)
+			if err != nil {
+				return fmt.Errorf("failed to get chain config: %w", err)
+			}
+			root = st.StateDB.IntermediateRoot(config.IsEIP158(new(big.Int).SetUint64(t.json.Env.Number)))
+			if root != common.Hash(post.Root) {
+				return fmt.Errorf("post-state root does not match the pre-state root, indicates an error in the test: got %x, want %x", root, post.Root)
+			}
+		}
 		return nil
 	}
 	post := t.json.Post[subtest.Fork][subtest.Index]
@@ -224,23 +258,24 @@ func (t *StateTest) Run(subtest StateSubtest, vmconfig vm.Config, snapshotter bo
 	if root != common.Hash(post.Root) {
 		return fmt.Errorf("post state root mismatch: got %x, want %x", root, post.Root)
 	}
-	if logs := rlpHash(statedb.Logs()); logs != common.Hash(post.Logs) {
+	if logs := rlpHash(st.StateDB.Logs()); logs != common.Hash(post.Logs) {
 		return fmt.Errorf("post state logs hash mismatch: got %x, want %x", logs, post.Logs)
 	}
-	statedb, _ = state.New(root, statedb.Database(), snaps)
+	st.StateDB, _ = state.New(root, st.StateDB.Database())
 	return nil
 }
 
-// RunNoVerify runs a specific subtest and returns the statedb and post-state root
-func (t *StateTest) RunNoVerify(subtest StateSubtest, vmconfig vm.Config, snapshotter bool, scheme string) (*trie.Database, *snapshot.Tree, *state.StateDB, common.Hash, error) {
+// RunNoVerify runs a specific subtest and returns the statedb and post-state root.
+// Remember to call state.Close after verifying the test result!
+func (t *StateTest) RunNoVerify(subtest StateSubtest, vmconfig vm.Config, snapshotter bool, scheme string) (st StateTestState, root common.Hash, gasUsed uint64, err error) {
 	config, eips, err := GetChainConfig(subtest.Fork)
 	if err != nil {
-		return nil, nil, nil, common.Hash{}, UnsupportedForkError{subtest.Fork}
+		return st, common.Hash{}, 0, UnsupportedForkError{subtest.Fork}
 	}
 	vmconfig.ExtraEips = eips
 
 	block := t.genesis(config).ToBlock()
-	triedb, snaps, statedb := MakePreState(rawdb.NewMemoryDatabase(), t.json.Pre, snapshotter, scheme)
+	st = MakePreState(rawdb.NewMemoryDatabase(), t.json.Pre, snapshotter, scheme)
 
 	var baseFee *big.Int
 	if config.IsLondon(new(big.Int)) {
@@ -254,8 +289,19 @@ func (t *StateTest) RunNoVerify(subtest StateSubtest, vmconfig vm.Config, snapsh
 	post := t.json.Post[subtest.Fork][subtest.Index]
 	msg, err := t.json.Tx.toMessage(post, baseFee)
 	if err != nil {
-		triedb.Close()
-		return nil, nil, nil, common.Hash{}, err
+		return st, common.Hash{}, 0, err
+	}
+
+	// Blob transactions may be present after the Cancun fork.
+	// In production,
+	// - the header is verified against the max in eip4844.go:VerifyEIP4844Header
+	// - the block body is verified against the header in block_validator.go:ValidateBody
+	// Here, we just do this shortcut smaller fix, since state tests do not
+	// utilize those codepaths.
+	if config.IsCancun(new(big.Int), block.Time()) {
+		if len(msg.BlobHashes) > eip4844.MaxBlobsPerBlock(config, block.Time()) {
+			return st, common.Hash{}, 0, errors.New("blob gas exceeds maximum")
+		}
 	}
 
 	// Try to recover tx with current signer
@@ -263,19 +309,15 @@ func (t *StateTest) RunNoVerify(subtest StateSubtest, vmconfig vm.Config, snapsh
 		var ttx types.Transaction
 		err := ttx.UnmarshalBinary(post.TxBytes)
 		if err != nil {
-			triedb.Close()
-			return nil, nil, nil, common.Hash{}, err
+			return st, common.Hash{}, 0, err
 		}
-
 		if _, err := types.Sender(types.LatestSigner(config), &ttx); err != nil {
-			triedb.Close()
-			return nil, nil, nil, common.Hash{}, err
+			return st, common.Hash{}, 0, err
 		}
 	}
 
 	// Prepare the EVM.
-	txContext := core.NewEVMTxContext(msg)
-	context := core.NewEVMBlockContext(block.Header(), nil, &t.json.Env.Coinbase)
+	context := core.NewEVMBlockContext(block.Header(), &dummyChain{config: config}, &t.json.Env.Coinbase)
 	context.GetHash = vmTestBlockHash
 	context.BaseFee = baseFee
 	context.Random = nil
@@ -288,78 +330,46 @@ func (t *StateTest) RunNoVerify(subtest StateSubtest, vmconfig vm.Config, snapsh
 		context.Difficulty = big.NewInt(0)
 	}
 	if config.IsCancun(new(big.Int), block.Time()) && t.json.Env.ExcessBlobGas != nil {
-		context.BlobBaseFee = eip4844.CalcBlobFee(*t.json.Env.ExcessBlobGas)
-	}
-	evm := vm.NewEVM(context, txContext, statedb, config, vmconfig)
-
-	{ // Blob transactions may be present after the Cancun fork.
-		// In production,
-		// - the header is verified against the max in eip4844.go:VerifyEIP4844Header
-		// - the block body is verified against the header in block_validator.go:ValidateBody
-		// Here, we just do this shortcut smaller fix, since state tests do not
-		// utilize those codepaths
-		if len(msg.BlobHashes)*params.BlobTxBlobGasPerBlob > params.MaxBlobGasPerBlock {
-			return nil, nil, nil, common.Hash{}, errors.New("blob gas exceeds maximum")
+		header := &types.Header{
+			Time:          block.Time(),
+			ExcessBlobGas: t.json.Env.ExcessBlobGas,
 		}
+		context.BlobBaseFee = eip4844.CalcBlobFee(config, header)
 	}
 
+	evm := vm.NewEVM(context, st.StateDB, config, vmconfig)
+
+	if tracer := vmconfig.Tracer; tracer != nil && tracer.OnTxStart != nil {
+		tracer.OnTxStart(evm.GetVMContext(), nil, msg.From)
+	}
 	// Execute the message.
-	snapshot := statedb.Snapshot()
-	gaspool := new(core.GasPool)
-	gaspool.AddGas(block.GasLimit())
-	_, err = core.ApplyMessage(evm, msg, gaspool)
+	snapshot := st.StateDB.Snapshot()
+	vmRet, err := core.ApplyMessage(evm, msg, core.NewGasPool(block.GasLimit()))
 	if err != nil {
-		statedb.RevertToSnapshot(snapshot)
+		st.StateDB.RevertToSnapshot(snapshot)
+		if tracer := evm.Config.Tracer; tracer != nil && tracer.OnTxEnd != nil {
+			evm.Config.Tracer.OnTxEnd(nil, err)
+		}
+		return st, common.Hash{}, 0, err
 	}
 	// Add 0-value mining reward. This only makes a difference in the cases
 	// where
 	// - the coinbase self-destructed, or
 	// - there are only 'bad' transactions, which aren't executed. In those cases,
 	//   the coinbase gets no txfee, so isn't created, and thus needs to be touched
-	statedb.AddBalance(block.Coinbase(), new(uint256.Int))
+	st.StateDB.AddBalance(block.Coinbase(), new(uint256.Int), tracing.BalanceChangeUnspecified)
 
 	// Commit state mutations into database.
-	root, _ := statedb.Commit(block.NumberU64(), config.IsEIP158(block.Number()))
-	return triedb, snaps, statedb, root, err
+	root, _ = st.StateDB.Commit(block.NumberU64(), config.IsEIP158(block.Number()), config.IsCancun(block.Number(), block.Time()))
+	if tracer := evm.Config.Tracer; tracer != nil && tracer.OnTxEnd != nil {
+		receipt := &types.Receipt{GasUsed: vmRet.UsedGas}
+		tracer.OnTxEnd(receipt, nil)
+	}
+	return st, root, vmRet.UsedGas, nil
 }
 
 func (t *StateTest) gasLimit(subtest StateSubtest) uint64 {
 	return t.json.Tx.GasLimit[t.json.Post[subtest.Fork][subtest.Index].Indexes.Gas]
-}
-
-func MakePreState(db ethdb.Database, accounts core.GenesisAlloc, snapshotter bool, scheme string) (*trie.Database, *snapshot.Tree, *state.StateDB) {
-	tconf := &trie.Config{Preimages: true}
-	if scheme == rawdb.HashScheme {
-		tconf.HashDB = hashdb.Defaults
-	} else {
-		tconf.PathDB = pathdb.Defaults
-	}
-	triedb := trie.NewDatabase(db, tconf)
-	sdb := state.NewDatabaseWithNodeDB(db, triedb)
-	statedb, _ := state.New(types.EmptyRootHash, sdb, nil)
-	for addr, a := range accounts {
-		statedb.SetCode(addr, a.Code)
-		statedb.SetNonce(addr, a.Nonce)
-		statedb.SetBalance(addr, uint256.MustFromBig(a.Balance))
-		for k, v := range a.Storage {
-			statedb.SetState(addr, k, v)
-		}
-	}
-	// Commit and re-open to start with a clean state.
-	root, _ := statedb.Commit(0, false)
-
-	var snaps *snapshot.Tree
-	if snapshotter {
-		snapconfig := snapshot.Config{
-			CacheSize:  1,
-			Recovery:   false,
-			NoBuild:    false,
-			AsyncBuild: false,
-		}
-		snaps, _ = snapshot.New(snapconfig, db, triedb, root)
-	}
-	statedb, _ = state.New(root, sdb, snaps)
-	return triedb, snaps, statedb
 }
 
 func (t *StateTest) genesis(config *params.ChainConfig) *core.Genesis {
@@ -370,6 +380,7 @@ func (t *StateTest) genesis(config *params.ChainConfig) *core.Genesis {
 		GasLimit:   t.json.Env.GasLimit,
 		Number:     t.json.Env.Number,
 		Timestamp:  t.json.Env.Timestamp,
+		SlotNumber: t.json.Env.SlotNumber,
 		Alloc:      t.json.Pre,
 	}
 	if t.json.Env.Random != nil {
@@ -381,6 +392,16 @@ func (t *StateTest) genesis(config *params.ChainConfig) *core.Genesis {
 }
 
 func (tx *stTransaction) toMessage(ps stPostState, baseFee *big.Int) (*core.Message, error) {
+	// The nonce is parsed as an arbitrary-precision integer so that fixtures
+	// probing the EIP-2681 limit can be loaded; such a transaction can never
+	// be RLP-decoded and must be rejected here.
+	var nonce uint64
+	if tx.Nonce != nil {
+		if !tx.Nonce.IsUint64() {
+			return nil, fmt.Errorf("nonce %v exceeds 2^64-1 (EIP-2681)", tx.Nonce)
+		}
+		nonce = tx.Nonce.Uint64()
+	}
 	var from common.Address
 	// If 'sender' field is present, use that
 	if tx.Sender != nil {
@@ -444,32 +465,49 @@ func (tx *stTransaction) toMessage(ps stPostState, baseFee *big.Int) (*core.Mess
 		if tx.MaxPriorityFeePerGas == nil {
 			tx.MaxPriorityFeePerGas = tx.MaxFeePerGas
 		}
-		gasPrice = math.BigMin(new(big.Int).Add(tx.MaxPriorityFeePerGas, baseFee),
-			tx.MaxFeePerGas)
+		gasPrice = new(big.Int).Add(tx.MaxPriorityFeePerGas, baseFee)
+		if gasPrice.Cmp(tx.MaxFeePerGas) > 0 {
+			gasPrice = tx.MaxFeePerGas
+		}
 	}
 	if gasPrice == nil {
 		return nil, errors.New("no gas price provided")
 	}
+	var authList []types.SetCodeAuthorization
+	if tx.AuthorizationList != nil {
+		authList = make([]types.SetCodeAuthorization, len(tx.AuthorizationList))
+		for i, auth := range tx.AuthorizationList {
+			authList[i] = types.SetCodeAuthorization{
+				ChainID: *uint256.MustFromBig(auth.ChainID),
+				Address: auth.Address,
+				Nonce:   auth.Nonce,
+				V:       auth.V,
+				R:       *uint256.MustFromBig(auth.R),
+				S:       *uint256.MustFromBig(auth.S),
+			}
+		}
+	}
 
 	msg := &core.Message{
-		From:          from,
-		To:            to,
-		Nonce:         tx.Nonce,
-		Value:         value,
-		GasLimit:      gasLimit,
-		GasPrice:      gasPrice,
-		GasFeeCap:     tx.MaxFeePerGas,
-		GasTipCap:     tx.MaxPriorityFeePerGas,
-		Data:          data,
-		AccessList:    accessList,
-		BlobHashes:    tx.BlobVersionedHashes,
-		BlobGasFeeCap: tx.BlobGasFeeCap,
+		From:                  from,
+		To:                    to,
+		Nonce:                 nonce,
+		Value:                 uint256.MustFromBig(value),
+		GasLimit:              gasLimit,
+		GasPrice:              uint256.MustFromBig(gasPrice),
+		GasFeeCap:             uint256.MustFromBig(tx.MaxFeePerGas),
+		GasTipCap:             uint256.MustFromBig(tx.MaxPriorityFeePerGas),
+		Data:                  data,
+		AccessList:            accessList,
+		BlobHashes:            tx.BlobVersionedHashes,
+		BlobGasFeeCap:         uint256.MustFromBig(tx.BlobGasFeeCap),
+		SetCodeAuthorizations: authList,
 	}
 	return msg, nil
 }
 
 func rlpHash(x interface{}) (h common.Hash) {
-	hw := sha3.NewLegacyKeccak256()
+	hw := keccak.NewLegacyKeccak256()
 	rlp.Encode(hw, x)
 	hw.Sum(h[:0])
 	return h
@@ -478,3 +516,74 @@ func rlpHash(x interface{}) (h common.Hash) {
 func vmTestBlockHash(n uint64) common.Hash {
 	return common.BytesToHash(crypto.Keccak256([]byte(big.NewInt(int64(n)).String())))
 }
+
+// StateTestState groups all the state database objects together for use in tests.
+type StateTestState struct {
+	StateDB   *state.StateDB
+	TrieDB    *triedb.Database
+	Snapshots *snapshot.Tree
+}
+
+// MakePreState creates a state containing the given allocation.
+func MakePreState(db ethdb.Database, accounts types.GenesisAlloc, snapshotter bool, scheme string) StateTestState {
+	tconf := &triedb.Config{Preimages: true}
+	if scheme == rawdb.HashScheme {
+		tconf.HashDB = hashdb.Defaults
+	} else {
+		tconf.PathDB = pathdb.Defaults
+	}
+	triedb := triedb.NewDatabase(db, tconf)
+	sdb := state.NewDatabase(triedb, nil)
+	statedb, _ := state.New(types.EmptyRootHash, sdb)
+	for addr, a := range accounts {
+		statedb.SetCode(addr, a.Code, tracing.CodeChangeUnspecified)
+		statedb.SetNonce(addr, a.Nonce, tracing.NonceChangeUnspecified)
+		statedb.SetBalance(addr, uint256.MustFromBig(a.Balance), tracing.BalanceChangeUnspecified)
+		for k, v := range a.Storage {
+			statedb.SetState(addr, k, v)
+		}
+	}
+	// Commit and re-open to start with a clean state.
+	root, _ := statedb.Commit(0, false, false)
+
+	// If snapshot is requested, initialize the snapshotter and use it in state.
+	var snaps *snapshot.Tree
+	if snapshotter && scheme == rawdb.HashScheme {
+		snapconfig := snapshot.Config{
+			CacheSize:  1,
+			Recovery:   false,
+			NoBuild:    false,
+			AsyncBuild: false,
+		}
+		snaps, _ = snapshot.New(snapconfig, db, triedb, root)
+	}
+	sdb = state.NewMPTDatabase(triedb, nil).WithSnapshot(snaps)
+	statedb, _ = state.New(root, sdb)
+	return StateTestState{statedb, triedb, snaps}
+}
+
+// Close should be called when the state is no longer needed, ie. after running the test.
+func (st *StateTestState) Close() {
+	if st.TrieDB != nil {
+		st.TrieDB.Close()
+		st.TrieDB = nil
+	}
+	if st.Snapshots != nil {
+		// Need to call Disable here to quit the snapshot generator goroutine.
+		st.Snapshots.Disable()
+		st.Snapshots.Release()
+		st.Snapshots = nil
+	}
+}
+
+// dummyChain implements the core.ChainContext interface.
+type dummyChain struct {
+	config *params.ChainConfig
+}
+
+func (d *dummyChain) Engine() consensus.Engine                        { return nil }
+func (d *dummyChain) GetHeader(h common.Hash, n uint64) *types.Header { return nil }
+func (d *dummyChain) Config() *params.ChainConfig                     { return d.config }
+func (d *dummyChain) CurrentHeader() *types.Header                    { return nil }
+func (d *dummyChain) GetHeaderByNumber(n uint64) *types.Header        { return nil }
+func (d *dummyChain) GetHeaderByHash(h common.Hash) *types.Header     { return nil }

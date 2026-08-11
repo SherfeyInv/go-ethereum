@@ -20,16 +20,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
 	"math/big"
 
-	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
+	"github.com/holiman/uint256"
 )
 
 // Options are the contextual parameters to execute the requested call.
@@ -42,6 +41,8 @@ type Options struct {
 	Chain  core.ChainContext   // Chain context to access past block hashes
 	Header *types.Header       // Header defining the block context to execute in
 	State  *state.StateDB      // Pre-state on top of which to estimate the gas
+
+	BlobBaseFee *big.Int // BlobBaseFee optionally overrides the blob base fee in the execution context.
 
 	ErrorRatio float64 // Allowed overestimation ratio for faster estimation termination
 }
@@ -60,18 +61,26 @@ func Estimate(ctx context.Context, call *core.Message, opts *Options, gasCap uin
 	if call.GasLimit >= params.TxGas {
 		hi = call.GasLimit
 	}
+
+	// Cap the maximum gas allowance according to EIP-7825 if the estimation targets Osaka
+	isOsaka := opts.Config.IsOsaka(opts.Header.Number, opts.Header.Time)
+	isAmsterdam := opts.Config.IsAmsterdam(opts.Header.Number, opts.Header.Time)
+	if hi > params.MaxTxGas && isOsaka && !isAmsterdam {
+		hi = params.MaxTxGas
+	}
+
 	// Normalize the max fee per gas the call is willing to spend.
-	var feeCap *big.Int
+	var feeCap *uint256.Int
 	if call.GasFeeCap != nil {
 		feeCap = call.GasFeeCap
 	} else if call.GasPrice != nil {
 		feeCap = call.GasPrice
 	} else {
-		feeCap = common.Big0
+		feeCap = uint256.NewInt(0)
 	}
 	// Recap the highest gas limit with account's available balance.
 	if feeCap.BitLen() != 0 {
-		balance := opts.State.GetBalance(call.From).ToBig()
+		balance := opts.State.GetBalance(call.From).Clone()
 
 		available := balance
 		if call.Value != nil {
@@ -80,13 +89,23 @@ func Estimate(ctx context.Context, call *core.Message, opts *Options, gasCap uin
 			}
 			available.Sub(available, call.Value)
 		}
-		allowance := new(big.Int).Div(available, feeCap)
+		if opts.Config.IsCancun(opts.Header.Number, opts.Header.Time) && len(call.BlobHashes) > 0 {
+			blobGasPerBlob := uint256.NewInt(params.BlobTxBlobGasPerBlob)
+			blobBalanceUsage := uint256.NewInt(uint64(len(call.BlobHashes)))
+			blobBalanceUsage.Mul(blobBalanceUsage, blobGasPerBlob)
+			blobBalanceUsage.Mul(blobBalanceUsage, call.BlobGasFeeCap)
+			if blobBalanceUsage.Cmp(available) >= 0 {
+				return 0, nil, core.ErrInsufficientFunds
+			}
+			available.Sub(available, blobBalanceUsage)
+		}
+		allowance := new(uint256.Int).Div(available, feeCap)
 
 		// If the allowance is larger than maximum uint64, skip checking
 		if allowance.IsUint64() && hi > allowance.Uint64() {
 			transfer := call.Value
 			if transfer == nil {
-				transfer = new(big.Int)
+				transfer = new(uint256.Int)
 			}
 			log.Debug("Gas estimation capped by limited funds", "original", hi, "balance", balance,
 				"sent", transfer, "maxFeePerGas", feeCap, "fundable", allowance)
@@ -132,7 +151,7 @@ func Estimate(ctx context.Context, call *core.Message, opts *Options, gasCap uin
 	// There's a fairly high chance for the transaction to execute successfully
 	// with gasLimit set to the first execution's usedGas + gasRefund. Explicitly
 	// check that gas amount and use as a limit for the binary search.
-	optimisticGasLimit := (result.UsedGas + result.RefundedGas + params.CallStipend) * 64 / 63
+	optimisticGasLimit := (result.MaxUsedGas + params.CallStipend) * 64 / 63
 	if optimisticGasLimit < hi {
 		failed, _, err = execute(ctx, call, opts, optimisticGasLimit)
 		if err != nil {
@@ -158,7 +177,7 @@ func Estimate(ctx context.Context, call *core.Message, opts *Options, gasCap uin
 				break
 			}
 		}
-		mid := (hi + lo) / 2
+		mid := lo + (hi-lo)/2
 		if mid > lo*2 {
 			// Most txs don't need much higher gas limit than their gas used, and most txs don't
 			// require near the full block limit of gas, so the selection of where to bisect the
@@ -197,6 +216,9 @@ func execute(ctx context.Context, call *core.Message, opts *Options, gasLimit ui
 		if errors.Is(err, core.ErrIntrinsicGas) {
 			return true, nil, nil // Special case, raise gas limit
 		}
+		if errors.Is(err, core.ErrGasLimitTooHigh) {
+			return true, nil, nil // Special case, lower gas limit
+		}
 		return true, nil, err // Bail out
 	}
 	return result.Failed(), result, nil
@@ -207,12 +229,23 @@ func execute(ctx context.Context, call *core.Message, opts *Options, gasLimit ui
 func run(ctx context.Context, call *core.Message, opts *Options) (*core.ExecutionResult, error) {
 	// Assemble the call and the call context
 	var (
-		msgContext = core.NewEVMTxContext(call)
 		evmContext = core.NewEVMBlockContext(opts.Header, opts.Chain, nil)
-
 		dirtyState = opts.State.Copy()
-		evm        = vm.NewEVM(evmContext, msgContext, dirtyState, opts.Config, vm.Config{NoBaseFee: true})
 	)
+	if opts.BlobBaseFee != nil {
+		evmContext.BlobBaseFee = new(big.Int).Set(opts.BlobBaseFee)
+	}
+	// Lower the basefee to 0 to avoid breaking EVM
+	// invariants (basefee < feecap).
+	if call.GasPrice.Sign() == 0 {
+		evmContext.BaseFee = new(big.Int)
+	}
+	if call.BlobGasFeeCap != nil && call.BlobGasFeeCap.BitLen() == 0 {
+		evmContext.BlobBaseFee = new(big.Int)
+	}
+	evm := vm.NewEVM(evmContext, dirtyState, opts.Config, vm.Config{NoBaseFee: true})
+	defer evm.Release()
+
 	// Monitor the outer context and interrupt the EVM upon cancellation. To avoid
 	// a dangling goroutine until the outer estimation finishes, create an internal
 	// context for the lifetime of this method call.
@@ -224,7 +257,7 @@ func run(ctx context.Context, call *core.Message, opts *Options) (*core.Executio
 		evm.Cancel()
 	}()
 	// Execute the call, returning a wrapped error or the result
-	result, err := core.ApplyMessage(evm, call, new(core.GasPool).AddGas(math.MaxUint64))
+	result, err := core.ApplyMessage(evm, call, nil)
 	if vmerr := dirtyState.Error(); vmerr != nil {
 		return nil, vmerr
 	}

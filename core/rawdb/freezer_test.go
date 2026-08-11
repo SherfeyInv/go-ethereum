@@ -22,17 +22,16 @@ import (
 	"fmt"
 	"math/big"
 	"math/rand"
-	"os"
-	"path"
 	"sync"
 	"testing"
 
+	"github.com/ethereum/go-ethereum/core/rawdb/ancienttest"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/stretchr/testify/require"
 )
 
-var freezerTestTableDef = map[string]bool{"test": true}
+var freezerTestTableDef = map[string]freezerTableConfig{"test": {noSnappy: true}}
 
 func TestFreezerModify(t *testing.T) {
 	t.Parallel()
@@ -48,7 +47,7 @@ func TestFreezerModify(t *testing.T) {
 		valuesRLP = append(valuesRLP, iv)
 	}
 
-	tables := map[string]bool{"raw": true, "rlp": false}
+	tables := map[string]freezerTableConfig{"raw": {noSnappy: true}, "rlp": {noSnappy: false}}
 	f, _ := newFreezerForTesting(t, tables)
 	defer f.Close()
 
@@ -112,7 +111,7 @@ func TestFreezerModifyRollback(t *testing.T) {
 	f.Close()
 
 	// Reopen and check that the rolled-back data doesn't reappear.
-	tables := map[string]bool{"test": true}
+	tables := map[string]freezerTableConfig{"test": {noSnappy: true}}
 	f2, err := NewFreezer(dir, "", false, 2049, tables)
 	if err != nil {
 		t.Fatalf("can't reopen freezer after failed ModifyAncients: %v", err)
@@ -240,7 +239,7 @@ func TestFreezerConcurrentModifyTruncate(t *testing.T) {
 		// fails, otherwise it succeeds. In either case, the freezer should be positioned
 		// at 10 after both operations are done.
 		if truncateErr != nil {
-			t.Fatal("concurrent truncate failed:", err)
+			t.Fatal("concurrent truncate failed:", truncateErr)
 		}
 		if !(errors.Is(modifyErr, nil) || errors.Is(modifyErr, errOutOrderInsertion)) {
 			t.Fatal("wrong error from concurrent modify:", modifyErr)
@@ -250,7 +249,7 @@ func TestFreezerConcurrentModifyTruncate(t *testing.T) {
 }
 
 func TestFreezerReadonlyValidate(t *testing.T) {
-	tables := map[string]bool{"a": true, "b": true}
+	tables := map[string]freezerTableConfig{"a": {noSnappy: true}, "b": {noSnappy: true}}
 	dir := t.TempDir()
 	// Open non-readonly freezer and fill individual tables
 	// with different amount of data.
@@ -275,7 +274,7 @@ func TestFreezerReadonlyValidate(t *testing.T) {
 	}
 	require.NoError(t, f.Close())
 
-	// Re-openening as readonly should fail when validating
+	// Re-opening as readonly should fail when validating
 	// table lengths.
 	_, err = NewFreezer(dir, "", true, 2049, tables)
 	if err == nil {
@@ -286,7 +285,7 @@ func TestFreezerReadonlyValidate(t *testing.T) {
 func TestFreezerConcurrentReadonly(t *testing.T) {
 	t.Parallel()
 
-	tables := map[string]bool{"a": true}
+	tables := map[string]freezerTableConfig{"a": {noSnappy: true}}
 	dir := t.TempDir()
 
 	f, err := NewFreezer(dir, "", false, 2049, tables)
@@ -334,7 +333,7 @@ func TestFreezerConcurrentReadonly(t *testing.T) {
 	}
 }
 
-func newFreezerForTesting(t *testing.T, tables map[string]bool) (*Freezer, string) {
+func newFreezerForTesting(t *testing.T, tables map[string]freezerTableConfig) (*Freezer, string) {
 	t.Helper()
 
 	dir := t.TempDir()
@@ -358,9 +357,6 @@ func checkAncientCount(t *testing.T, f *Freezer, kind string, n uint64) {
 	// Check at index n-1.
 	if n > 0 {
 		index := n - 1
-		if ok, _ := f.HasAncient(kind, index); !ok {
-			t.Errorf("HasAncient(%q, %d) returned false unexpectedly", kind, index)
-		}
 		if _, err := f.Ancient(kind, index); err != nil {
 			t.Errorf("Ancient(%q, %d) returned unexpected error %q", kind, index, err)
 		}
@@ -368,9 +364,6 @@ func checkAncientCount(t *testing.T, f *Freezer, kind string, n uint64) {
 
 	// Check at index n.
 	index := n
-	if ok, _ := f.HasAncient(kind, index); ok {
-		t.Errorf("HasAncient(%q, %d) returned true unexpectedly", kind, index)
-	}
 	if _, err := f.Ancient(kind, index); err == nil {
 		t.Errorf("Ancient(%q, %d) didn't return expected error", kind, index)
 	} else if err != errOutOfBounds {
@@ -378,90 +371,136 @@ func checkAncientCount(t *testing.T, f *Freezer, kind string, n uint64) {
 	}
 }
 
-func TestRenameWindows(t *testing.T) {
-	var (
-		fname   = "file.bin"
-		fname2  = "file2.bin"
-		data    = []byte{1, 2, 3, 4}
-		data2   = []byte{2, 3, 4, 5}
-		data3   = []byte{3, 5, 6, 7}
-		dataLen = 4
-	)
+// TestChainFreezerBALAlignment exercises the new-table alignment path: a chain
+// freezer is first opened with the legacy table set (no BAL), populated with a
+// few blocks and closed. It is then re-opened with the full chain freezer
+// table set (which includes the BAL column). The expectation is that the BAL
+// table is fast-forwarded to the existing head without disturbing the body /
+// receipt tables, and that subsequent writes append cleanly across all tables.
+func TestChainFreezerBALAlignment(t *testing.T) {
+	dir := t.TempDir()
 
-	// Create 2 temp dirs
-	dir1 := t.TempDir()
-	dir2 := t.TempDir()
-
-	// Create file in dir1 and fill with data
-	f, err := os.Create(path.Join(dir1, fname))
-	if err != nil {
-		t.Fatal(err)
-	}
-	f2, err := os.Create(path.Join(dir1, fname2))
-	if err != nil {
-		t.Fatal(err)
-	}
-	f3, err := os.Create(path.Join(dir2, fname2))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.Write(data); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f2.Write(data2); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f3.Write(data3); err != nil {
-		t.Fatal(err)
-	}
-	if err := f.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := f2.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := f3.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Rename(f.Name(), path.Join(dir2, fname)); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Rename(f2.Name(), path.Join(dir2, fname2)); err != nil {
-		t.Fatal(err)
+	// Build a "legacy" subset of the chain freezer table set, omitting BAL.
+	legacyTables := make(map[string]freezerTableConfig)
+	for name, cfg := range chainFreezerTableConfigs {
+		if name == ChainFreezerBALTable {
+			continue
+		}
+		legacyTables[name] = cfg
 	}
 
-	// Check file contents
-	f, err = os.Open(path.Join(dir2, fname))
+	// First open: legacy config. Fill in `items` blocks of dummy data.
+	const items = uint64(10)
+	payload := bytes.Repeat([]byte{0xab}, 64)
+
+	f, err := NewFreezer(dir, "", false, 2049, legacyTables)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("can't open legacy freezer: %v", err)
+	}
+	if _, err := f.ModifyAncients(func(op ethdb.AncientWriteOp) error {
+		for i := uint64(0); i < items; i++ {
+			if err := op.AppendRaw(ChainFreezerHashTable, i, payload); err != nil {
+				return err
+			}
+			if err := op.AppendRaw(ChainFreezerHeaderTable, i, payload); err != nil {
+				return err
+			}
+			if err := op.AppendRaw(ChainFreezerBodiesTable, i, payload); err != nil {
+				return err
+			}
+			if err := op.AppendRaw(ChainFreezerReceiptTable, i, payload); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("legacy write failed: %v", err)
+	}
+	if got, _ := f.Ancients(); got != items {
+		t.Fatalf("legacy head: got %d, want %d", got, items)
+	}
+	require.NoError(t, f.Close())
+
+	// Re-open with the full chain freezer table set, which now includes BAL.
+	// repair() should detect the empty BAL table and fast-forward it to the
+	// existing head rather than truncating everyone down to zero.
+	f, err = NewFreezer(dir, "", false, 2049, chainFreezerTableConfigs)
+	if err != nil {
+		t.Fatalf("can't re-open freezer with BAL added: %v", err)
 	}
 	defer f.Close()
-	defer os.Remove(f.Name())
-	buf := make([]byte, dataLen)
-	if _, err := f.Read(buf); err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(buf, data) {
-		t.Errorf("unexpected file contents. Got %v\n", buf)
-	}
 
-	f, err = os.Open(path.Join(dir2, fname2))
+	// The head must be preserved.
+	if got, _ := f.Ancients(); got != items {
+		t.Fatalf("head after re-open: got %d, want %d", got, items)
+	}
+	// Existing data must still be readable in full.
+	for i := uint64(0); i < items; i++ {
+		for _, kind := range []string{
+			ChainFreezerHashTable, ChainFreezerHeaderTable,
+			ChainFreezerBodiesTable, ChainFreezerReceiptTable,
+		} {
+			got, err := f.Ancient(kind, i)
+			if err != nil {
+				t.Fatalf("read %s[%d]: %v", kind, i, err)
+			}
+			if !bytes.Equal(got, payload) {
+				t.Fatalf("read %s[%d]: payload mismatch", kind, i)
+			}
+		}
+	}
+	// The block-data tail must be unchanged (no spurious tail bump).
+	if tail, err := f.Tail(ChainFreezerBlockDataGroup); err != nil || tail != 0 {
+		t.Fatalf("blockdata tail: got %d (err %v), want 0", tail, err)
+	}
+	// The BAL tail should equal the head — the table is empty but aligned.
+	if tail, err := f.Tail(ChainFreezerBALGroup); err != nil || tail != items {
+		t.Fatalf("BAL tail: got %d (err %v), want %d", tail, err, items)
+	}
+	// Reads to BAL for any pre-alignment block must report out-of-bounds.
+	for i := uint64(0); i < items; i++ {
+		if _, err := f.Ancient(ChainFreezerBALTable, i); err == nil {
+			t.Fatalf("reading BAL[%d] succeeded; want error (out of bounds)", i)
+		}
+	}
+	// A subsequent batch must append uniformly to every table, BAL included.
+	balPayload := []byte("real-bal")
+	if _, err := f.ModifyAncients(func(op ethdb.AncientWriteOp) error {
+		i := items
+		if err := op.AppendRaw(ChainFreezerHashTable, i, payload); err != nil {
+			return err
+		}
+		if err := op.AppendRaw(ChainFreezerHeaderTable, i, payload); err != nil {
+			return err
+		}
+		if err := op.AppendRaw(ChainFreezerBodiesTable, i, payload); err != nil {
+			return err
+		}
+		if err := op.AppendRaw(ChainFreezerReceiptTable, i, payload); err != nil {
+			return err
+		}
+		if err := op.AppendRaw(ChainFreezerBALTable, i, balPayload); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("post-alignment write failed: %v", err)
+	}
+	if got, _ := f.Ancients(); got != items+1 {
+		t.Fatalf("head after post-alignment write: got %d, want %d", got, items+1)
+	}
+	got, err := f.Ancient(ChainFreezerBALTable, items)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("BAL[%d]: %v", items, err)
 	}
-	defer f.Close()
-	defer os.Remove(f.Name())
-	if _, err := f.Read(buf); err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(buf, data2) {
-		t.Errorf("unexpected file contents. Got %v\n", buf)
+	if !bytes.Equal(got, balPayload) {
+		t.Fatalf("BAL[%d]: got %x, want %x", items, got, balPayload)
 	}
 }
 
 func TestFreezerCloseSync(t *testing.T) {
 	t.Parallel()
-	f, _ := newFreezerForTesting(t, map[string]bool{"a": true, "b": true})
+	f, _ := newFreezerForTesting(t, map[string]freezerTableConfig{"a": {noSnappy: true}, "b": {noSnappy: true}})
 	defer f.Close()
 
 	// Now, close and sync. This mimics the behaviour if the node is shut down,
@@ -474,9 +513,34 @@ func TestFreezerCloseSync(t *testing.T) {
 	if err := f.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := f.Sync(); err == nil {
+	if err := f.SyncAncient(); err == nil {
 		t.Fatalf("want error, have nil")
 	} else if have, want := err.Error(), "[closed closed]"; have != want {
-		t.Fatalf("want %v, have %v", have, want)
+		t.Fatalf("want %v, have %v", want, have)
 	}
+}
+
+func TestFreezerSuite(t *testing.T) {
+	ancienttest.TestAncientSuite(t, func(kinds []string) ethdb.AncientStore {
+		tables := make(map[string]freezerTableConfig)
+		for _, kind := range kinds {
+			tables[kind] = freezerTableConfig{
+				noSnappy:  true,
+				tailGroup: ancienttest.TailGroup,
+			}
+		}
+		f, _ := newFreezerForTesting(t, tables)
+		return f
+	})
+	ancienttest.TestResettableAncientSuite(t, func(kinds []string) ethdb.ResettableAncientStore {
+		tables := make(map[string]freezerTableConfig)
+		for _, kind := range kinds {
+			tables[kind] = freezerTableConfig{
+				noSnappy:  true,
+				tailGroup: ancienttest.TailGroup,
+			}
+		}
+		f, _ := newResettableFreezer(t.TempDir(), "", false, 2048, tables)
+		return f
+	})
 }

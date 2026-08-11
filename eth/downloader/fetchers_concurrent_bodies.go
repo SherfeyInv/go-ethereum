@@ -78,7 +78,6 @@ func (q *bodyQueue) request(peer *peerConnection, req *fetchRequest, resCh chan 
 	if q.bodyFetchHook != nil {
 		q.bodyFetchHook(req.Headers)
 	}
-
 	hashes := make([]common.Hash, 0, len(req.Headers))
 	for _, header := range req.Headers {
 		hashes = append(hashes, header.Hash())
@@ -89,15 +88,14 @@ func (q *bodyQueue) request(peer *peerConnection, req *fetchRequest, resCh chan 
 // deliver is responsible for taking a generic response packet from the concurrent
 // fetcher, unpacking the body data and delivering it to the downloader's queue.
 func (q *bodyQueue) deliver(peer *peerConnection, packet *eth.Response) (int, error) {
-	txs, uncles, withdrawals := packet.Res.(*eth.BlockBodiesResponse).Unpack()
-	hashsets := packet.Meta.([][]common.Hash) // {txs hashes, uncle hashes, withdrawal hashes}
-
-	accepted, err := q.queue.DeliverBodies(peer.id, txs, hashsets[0], uncles, hashsets[1], withdrawals, hashsets[2])
+	resp := packet.Res.(*eth.BlockBodiesResponse)
+	meta := packet.Meta.(eth.BlockBodyHashes)
+	accepted, err := q.queue.DeliverBodies(peer.id, meta, *resp)
 	switch {
-	case err == nil && len(txs) == 0:
+	case err == nil && len(*resp) == 0:
 		peer.log.Trace("Requested bodies delivered")
 	case err == nil:
-		peer.log.Trace("Delivered new batch of bodies", "count", len(txs), "accepted", accepted)
+		peer.log.Trace("Delivered new batch of bodies", "count", len(*resp), "accepted", accepted)
 	default:
 		peer.log.Debug("Failed to deliver retrieved bodies", "err", err)
 	}

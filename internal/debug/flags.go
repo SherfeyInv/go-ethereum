@@ -19,6 +19,7 @@ package debug
 import (
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	_ "net/http/pprof"
@@ -30,15 +31,11 @@ import (
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/metrics"
 	"github.com/ethereum/go-ethereum/metrics/exp"
-	"github.com/fjl/memsize/memsizeui"
 	"github.com/mattn/go-colorable"
 	"github.com/mattn/go-isatty"
 	"github.com/urfave/cli/v2"
-	"golang.org/x/exp/slog"
 	"gopkg.in/natefinch/lumberjack.v2"
 )
-
-var Memsize memsizeui.Handler
 
 var (
 	verbosityFlag = &cli.IntFlag{
@@ -58,13 +55,13 @@ var (
 		Usage:    "Per-module verbosity: comma-separated list of <pattern>=<level> (e.g. eth/*=5,p2p=4)",
 		Value:    "",
 		Hidden:   true,
-		Category: flags.LoggingCategory,
+		Category: flags.DeprecatedCategory,
 	}
 	logjsonFlag = &cli.BoolFlag{
 		Name:     "log.json",
 		Usage:    "Format logs with JSON",
 		Hidden:   true,
-		Category: flags.LoggingCategory,
+		Category: flags.DeprecatedCategory,
 	}
 	logFormatFlag = &cli.StringFlag{
 		Name:     "log.format",
@@ -139,8 +136,8 @@ var (
 		Category: flags.LoggingCategory,
 	}
 	traceFlag = &cli.StringFlag{
-		Name:     "trace",
-		Usage:    "Write execution trace to the given file",
+		Name:     "go-execution-trace",
+		Usage:    "Write Go execution trace to the given file",
 		Category: flags.LoggingCategory,
 	}
 )
@@ -165,6 +162,11 @@ var Flags = []cli.Flag{
 	blockprofilerateFlag,
 	cpuprofileFlag,
 	traceFlag,
+	pyroscopeFlag,
+	pyroscopeServerFlag,
+	pyroscopeAuthUsernameFlag,
+	pyroscopeAuthPasswordFlag,
+	pyroscopeTagsFlag,
 }
 
 var (
@@ -301,6 +303,14 @@ func Setup(ctx *cli.Context) error {
 		// It cannot be imported because it will cause a cyclical dependency.
 		StartPProf(address, !ctx.IsSet("metrics.addr"))
 	}
+
+	// Pyroscope profiling
+	if ctx.Bool(pyroscopeFlag.Name) {
+		if err := startPyroscope(ctx); err != nil {
+			return err
+		}
+	}
+
 	if len(logFile) > 0 || rotation {
 		log.Info("Logging configured", context...)
 	}
@@ -313,7 +323,6 @@ func StartPProf(address string, withMetrics bool) {
 	if withMetrics {
 		exp.Exp(metrics.DefaultRegistry)
 	}
-	http.Handle("/memsize/", http.StripPrefix("/memsize", &Memsize))
 	log.Info("Starting pprof server", "addr", fmt.Sprintf("http://%s/debug/pprof", address))
 	go func() {
 		if err := http.ListenAndServe(address, nil); err != nil {
@@ -325,6 +334,7 @@ func StartPProf(address string, withMetrics bool) {
 // Exit stops all running profiles, flushing their output to the
 // respective file.
 func Exit() {
+	stopPyroscope()
 	Handler.StopCPUProfile()
 	Handler.StopGoTrace()
 	if logOutputFile != nil {

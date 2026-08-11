@@ -28,7 +28,7 @@ import (
 	"github.com/ethereum/go-ethereum/consensus/ethash"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/rawdb"
-	"github.com/ethereum/go-ethereum/core/vm"
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/p2p"
 	"github.com/ethereum/go-ethereum/p2p/enode"
 	"github.com/ethereum/go-ethereum/params"
@@ -57,6 +57,12 @@ func FuzzByteCodes(f *testing.F) {
 func FuzzTrieNodes(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
 		doFuzz(data, &GetTrieNodesPacket{}, GetTrieNodesMsg)
+	})
+}
+
+func FuzzAccessLists(f *testing.F) {
+	f.Fuzz(func(t *testing.T, data []byte) {
+		doFuzz(data, &GetAccessListsPacket{}, GetAccessListsMsg)
 	})
 }
 
@@ -89,7 +95,7 @@ func doFuzz(input []byte, obj interface{}, code int) {
 var trieRoot common.Hash
 
 func getChain() *core.BlockChain {
-	ga := make(core.GenesisAlloc, 1000)
+	ga := make(types.GenesisAlloc, 1000)
 	var a = make([]byte, 20)
 	var mkStorage = func(k, v int) (common.Hash, common.Hash) {
 		var kB = make([]byte, 32)
@@ -105,7 +111,7 @@ func getChain() *core.BlockChain {
 	}
 	for i := 0; i < 1000; i++ {
 		binary.LittleEndian.PutUint64(a, uint64(i+0xff))
-		acc := core.GenesisAccount{Balance: big.NewInt(int64(i))}
+		acc := types.Account{Balance: big.NewInt(int64(i))}
 		if i%2 == 1 {
 			acc.Storage = storage
 		}
@@ -116,16 +122,16 @@ func getChain() *core.BlockChain {
 		Alloc:  ga,
 	}
 	_, blocks, _ := core.GenerateChainWithGenesis(gspec, ethash.NewFaker(), 2, func(i int, gen *core.BlockGen) {})
-	cacheConf := &core.CacheConfig{
-		TrieCleanLimit:      0,
-		TrieDirtyLimit:      0,
-		TrieTimeLimit:       5 * time.Minute,
-		TrieCleanNoPrefetch: true,
-		SnapshotLimit:       100,
-		SnapshotWait:        true,
+	options := &core.BlockChainConfig{
+		TrieCleanLimit: 0,
+		TrieDirtyLimit: 0,
+		TrieTimeLimit:  5 * time.Minute,
+		NoPrefetch:     true,
+		SnapshotLimit:  100,
+		SnapshotWait:   true,
 	}
 	trieRoot = blocks[len(blocks)-1].Root()
-	bc, _ := core.NewBlockChain(rawdb.NewMemoryDatabase(), cacheConf, gspec, nil, ethash.NewFaker(), vm.Config{}, nil, nil)
+	bc, _ := core.NewBlockChain(rawdb.NewMemoryDatabase(), gspec, ethash.NewFaker(), options)
 	if _, err := bc.InsertChain(blocks); err != nil {
 		panic(err)
 	}

@@ -18,6 +18,7 @@ package rlp
 
 import (
 	"fmt"
+	"maps"
 	"reflect"
 	"sync"
 	"sync/atomic"
@@ -90,10 +91,7 @@ func (c *typeCache) generate(typ reflect.Type, tags rlpstruct.Tags) *typeinfo {
 	}
 
 	// Copy cur to next.
-	c.next = make(map[typekey]*typeinfo, len(cur)+1)
-	for k, v := range cur {
-		c.next[k] = v
-	}
+	c.next = maps.Clone(cur)
 
 	// Generate.
 	info := c.infoWhileGenerating(typ, tags)
@@ -205,7 +203,7 @@ func rtypeToStructType(typ reflect.Type, rec map[reflect.Type]*rlpstruct.Type) *
 		IsDecoder: typ.Implements(decoderInterface),
 	}
 	rec[typ] = t
-	if k == reflect.Array || k == reflect.Slice || k == reflect.Ptr {
+	if k == reflect.Array || k == reflect.Slice || k == reflect.Pointer {
 		t.Elem = rtypeToStructType(typ.Elem(), rec)
 	}
 	return t

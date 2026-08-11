@@ -21,8 +21,10 @@ import (
 	"math/rand"
 	"testing"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/holiman/uint256"
 )
 
 // Tests that transactions can be added to strict lists and list contents and
@@ -51,6 +53,58 @@ func TestStrictListAdd(t *testing.T) {
 	}
 }
 
+// TestListAddVeryExpensive tests adding txs which exceed 256 bits in cost. It is
+// expected that the list does not panic.
+func TestListAddVeryExpensive(t *testing.T) {
+	key, _ := crypto.GenerateKey()
+	list := newList(true)
+	for i := 0; i < 3; i++ {
+		value := big.NewInt(100)
+		gasprice, _ := new(big.Int).SetString("0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", 0)
+		gaslimit := uint64(i)
+		tx, _ := types.SignTx(types.NewTransaction(uint64(i), common.Address{}, value, gaslimit, gasprice, nil), types.HomesteadSigner{}, key)
+		t.Logf("cost: %x bitlen: %d\n", tx.Cost(), tx.Cost().BitLen())
+		list.Add(tx, DefaultConfig.PriceBump)
+	}
+}
+
+// TestPriceHeapCmp tests that the price heap comparison function works as intended.
+// It also tests combinations where the basefee is higher than the gas fee cap, which
+// are useful to sort in the mempool to support basefee changes.
+func TestPriceHeapCmp(t *testing.T) {
+	key, _ := crypto.GenerateKey()
+	txs := []*types.Transaction{
+		// nonce, gaslimit, gasfee, gastip
+		dynamicFeeTx(0, 1000, big.NewInt(2), big.NewInt(1), key),
+		dynamicFeeTx(0, 1000, big.NewInt(1), big.NewInt(2), key),
+		dynamicFeeTx(0, 1000, big.NewInt(1), big.NewInt(1), key),
+		dynamicFeeTx(0, 1000, big.NewInt(1), big.NewInt(0), key),
+	}
+
+	// create priceHeap
+	ph := &priceHeap{}
+
+	// now set the basefee on the heap
+	for _, basefee := range []uint64{0, 1, 2, 3} {
+		ph.baseFee = uint256.NewInt(basefee)
+
+		for i := 0; i < len(txs); i++ {
+			for j := 0; j < len(txs); j++ {
+				switch {
+				case i == j:
+					if c := ph.cmp(txs[i], txs[j]); c != 0 {
+						t.Errorf("tx %d should be equal priority to tx %d with basefee %d (cmp=%d)", i, j, basefee, c)
+					}
+				case i < j:
+					if c := ph.cmp(txs[i], txs[j]); c != 1 {
+						t.Errorf("tx %d vs tx %d comparison inconsistent with basefee %d (cmp=%d)", i, j, basefee, c)
+					}
+				}
+			}
+		}
+	}
+}
+
 func BenchmarkListAdd(b *testing.B) {
 	// Generate a list of transactions to insert
 	key, _ := crypto.GenerateKey()
@@ -60,7 +114,7 @@ func BenchmarkListAdd(b *testing.B) {
 		txs[i] = transaction(uint64(i), 0, key)
 	}
 	// Insert the transactions in a random order
-	priceLimit := big.NewInt(int64(DefaultConfig.PriceLimit))
+	priceLimit := uint256.NewInt(DefaultConfig.PriceLimit)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		list := newList(true)
@@ -68,5 +122,27 @@ func BenchmarkListAdd(b *testing.B) {
 			list.Add(txs[v], DefaultConfig.PriceBump)
 			list.Filter(priceLimit, DefaultConfig.PriceBump)
 		}
+	}
+}
+
+func BenchmarkListCapOneTx(b *testing.B) {
+	// Generate a list of transactions to insert
+	key, _ := crypto.GenerateKey()
+
+	txs := make(types.Transactions, 32)
+	for i := 0; i < len(txs); i++ {
+		txs[i] = transaction(uint64(i), 0, key)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		list := newList(true)
+		// Insert the transactions in a random order
+		for _, v := range rand.Perm(len(txs)) {
+			list.Add(txs[v], DefaultConfig.PriceBump)
+		}
+		b.StartTimer()
+		list.Cap(list.Len() - 1)
+		b.StopTimer()
 	}
 }

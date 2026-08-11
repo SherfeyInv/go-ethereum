@@ -95,6 +95,7 @@ func (hub *Hub) readPairings() error {
 		}
 		return err
 	}
+	defer pairingFile.Close()
 
 	pairingData, err := io.ReadAll(pairingFile)
 	if err != nil {
@@ -112,7 +113,7 @@ func (hub *Hub) readPairings() error {
 }
 
 func (hub *Hub) writePairings() error {
-	pairingFile, err := os.OpenFile(filepath.Join(hub.datadir, "smartcards.json"), os.O_RDWR|os.O_CREATE, 0755)
+	pairingFile, err := os.OpenFile(filepath.Join(hub.datadir, "smartcards.json"), os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0755)
 	if err != nil {
 		return err
 	}
@@ -128,11 +129,8 @@ func (hub *Hub) writePairings() error {
 		return err
 	}
 
-	if _, err := pairingFile.Write(pairingData); err != nil {
-		return err
-	}
-
-	return nil
+	_, err = pairingFile.Write(pairingData)
+	return err
 }
 
 func (hub *Hub) pairing(wallet *Wallet) *smartcardPairing {
@@ -241,7 +239,7 @@ func (hub *Hub) refreshWallets() {
 			card.Disconnect(pcsc.LeaveCard)
 			continue
 		}
-		// Card connected, start tracking in amongs the wallets
+		// Card connected, start tracking among the wallets
 		hub.wallets[reader] = wallet
 		events = append(events, accounts.WalletEvent{Wallet: wallet, Kind: accounts.WalletArrived})
 	}

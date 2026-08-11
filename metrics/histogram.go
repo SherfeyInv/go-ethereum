@@ -1,10 +1,19 @@
 package metrics
 
 type HistogramSnapshot interface {
-	SampleSnapshot
+	Count() int64
+	Max() int64
+	Mean() float64
+	Min() int64
+	Percentile(float64) float64
+	Percentiles([]float64) []float64
+	Size() int
+	StdDev() float64
+	Sum() int64
+	Variance() float64
 }
 
-// Histograms calculate distribution statistics from a series of int64 values.
+// Histogram calculates distribution statistics from a series of int64 values.
 type Histogram interface {
 	Clear()
 	Update(int64)
@@ -14,27 +23,24 @@ type Histogram interface {
 // GetOrRegisterHistogram returns an existing Histogram or constructs and
 // registers a new StandardHistogram.
 func GetOrRegisterHistogram(name string, r Registry, s Sample) Histogram {
-	if nil == r {
+	if r == nil {
 		r = DefaultRegistry
 	}
-	return r.GetOrRegister(name, func() Histogram { return NewHistogram(s) }).(Histogram)
+	return r.GetOrRegister(name, func() any { return NewHistogram(s) }).(Histogram)
 }
 
 // GetOrRegisterHistogramLazy returns an existing Histogram or constructs and
 // registers a new StandardHistogram.
 func GetOrRegisterHistogramLazy(name string, r Registry, s func() Sample) Histogram {
-	if nil == r {
+	if r == nil {
 		r = DefaultRegistry
 	}
-	return r.GetOrRegister(name, func() Histogram { return NewHistogram(s()) }).(Histogram)
+	return r.GetOrRegister(name, func() any { return NewHistogram(s()) }).(Histogram)
 }
 
 // NewHistogram constructs a new StandardHistogram from a Sample.
 func NewHistogram(s Sample) Histogram {
-	if !Enabled {
-		return NilHistogram{}
-	}
-	return &StandardHistogram{sample: s}
+	return &StandardHistogram{s}
 }
 
 // NewRegisteredHistogram constructs and registers a new StandardHistogram from
@@ -47,13 +53,6 @@ func NewRegisteredHistogram(name string, r Registry, s Sample) Histogram {
 	r.Register(name, c)
 	return c
 }
-
-// NilHistogram is a no-op Histogram.
-type NilHistogram struct{}
-
-func (NilHistogram) Clear()                      {}
-func (NilHistogram) Snapshot() HistogramSnapshot { return (*emptySnapshot)(nil) }
-func (NilHistogram) Update(v int64)              {}
 
 // StandardHistogram is the standard implementation of a Histogram and uses a
 // Sample to bound its memory use.

@@ -20,7 +20,7 @@ import (
 	"encoding/json"
 	"sync"
 
-	gokzg4844 "github.com/crate-crypto/go-kzg-4844"
+	gokzg4844 "github.com/crate-crypto/go-eth-kzg"
 )
 
 // context is the crypto primitive pre-seeded with the trusted setup parameters.
@@ -46,10 +46,10 @@ func gokzgInit() {
 }
 
 // gokzgBlobToCommitment creates a small commitment out of a data blob.
-func gokzgBlobToCommitment(blob Blob) (Commitment, error) {
+func gokzgBlobToCommitment(blob *Blob) (Commitment, error) {
 	gokzgIniter.Do(gokzgInit)
 
-	commitment, err := context.BlobToKZGCommitment((gokzg4844.Blob)(blob), 0)
+	commitment, err := context.BlobToKZGCommitment((*gokzg4844.Blob)(blob), 0)
 	if err != nil {
 		return Commitment{}, err
 	}
@@ -58,10 +58,10 @@ func gokzgBlobToCommitment(blob Blob) (Commitment, error) {
 
 // gokzgComputeProof computes the KZG proof at the given point for the polynomial
 // represented by the blob.
-func gokzgComputeProof(blob Blob, point Point) (Proof, Claim, error) {
+func gokzgComputeProof(blob *Blob, point Point) (Proof, Claim, error) {
 	gokzgIniter.Do(gokzgInit)
 
-	proof, claim, err := context.ComputeKZGProof((gokzg4844.Blob)(blob), (gokzg4844.Scalar)(point), 0)
+	proof, claim, err := context.ComputeKZGProof((*gokzg4844.Blob)(blob), (gokzg4844.Scalar)(point), 0)
 	if err != nil {
 		return Proof{}, Claim{}, err
 	}
@@ -80,10 +80,10 @@ func gokzgVerifyProof(commitment Commitment, point Point, claim Claim, proof Pro
 // the commitment.
 //
 // This method does not verify that the commitment is correct with respect to blob.
-func gokzgComputeBlobProof(blob Blob, commitment Commitment) (Proof, error) {
+func gokzgComputeBlobProof(blob *Blob, commitment Commitment) (Proof, error) {
 	gokzgIniter.Do(gokzgInit)
 
-	proof, err := context.ComputeBlobKZGProof((gokzg4844.Blob)(blob), (gokzg4844.KZGCommitment)(commitment), 0)
+	proof, err := context.ComputeBlobKZGProof((*gokzg4844.Blob)(blob), (gokzg4844.KZGCommitment)(commitment), 0)
 	if err != nil {
 		return Proof{}, err
 	}
@@ -91,8 +91,142 @@ func gokzgComputeBlobProof(blob Blob, commitment Commitment) (Proof, error) {
 }
 
 // gokzgVerifyBlobProof verifies that the blob data corresponds to the provided commitment.
-func gokzgVerifyBlobProof(blob Blob, commitment Commitment, proof Proof) error {
+func gokzgVerifyBlobProof(blob *Blob, commitment Commitment, proof Proof) error {
 	gokzgIniter.Do(gokzgInit)
 
-	return context.VerifyBlobKZGProof((gokzg4844.Blob)(blob), (gokzg4844.KZGCommitment)(commitment), (gokzg4844.KZGProof)(proof))
+	return context.VerifyBlobKZGProof((*gokzg4844.Blob)(blob), (gokzg4844.KZGCommitment)(commitment), (gokzg4844.KZGProof)(proof))
+}
+
+// gokzgComputeCellProofs returns the KZG cell proofs that are used to verify the blob against
+// the commitment.
+//
+// This method does not verify that the commitment is correct with respect to blob.
+func gokzgComputeCellProofs(blob *Blob) ([]Proof, error) {
+	gokzgIniter.Do(gokzgInit)
+
+	_, proofs, err := context.ComputeCellsAndKZGProofs((*gokzg4844.Blob)(blob), 0)
+	if err != nil {
+		return []Proof{}, err
+	}
+	p := make([]Proof, len(proofs))
+	for i, proof := range proofs {
+		p[i] = (Proof)(proof)
+	}
+	return p, nil
+}
+
+// gokzgVerifyCellProofBatch verifies that the blob data corresponds to the provided commitment.
+func gokzgVerifyCellProofBatch(blobs []Blob, commitments []Commitment, cellProofs []Proof) error {
+	gokzgIniter.Do(gokzgInit)
+
+	var (
+		proofs      = make([]gokzg4844.KZGProof, len(cellProofs))
+		commits     = make([]gokzg4844.KZGCommitment, 0, len(cellProofs))
+		cellIndices = make([]uint64, 0, len(cellProofs))
+		cells       = make([]*gokzg4844.Cell, 0, len(cellProofs))
+	)
+	// Copy over the cell proofs
+	for i, proof := range cellProofs {
+		proofs[i] = gokzg4844.KZGProof(proof)
+	}
+	// Blow up the commitments to be the same length as the proofs
+	for _, commitment := range commitments {
+		for range gokzg4844.CellsPerExtBlob {
+			commits = append(commits, gokzg4844.KZGCommitment(commitment))
+		}
+	}
+	// Compute the cell and cell indices
+	for i := range blobs {
+		cellsI, err := context.ComputeCells((*gokzg4844.Blob)(&blobs[i]), 2)
+		if err != nil {
+			return err
+		}
+		cells = append(cells, cellsI[:]...)
+		for idx := range len(cellsI) {
+			cellIndices = append(cellIndices, uint64(idx))
+		}
+	}
+	return context.VerifyCellKZGProofBatch(commits, cellIndices, cells[:], proofs)
+}
+
+// gokzgVerifyCells verifies that the cell data corresponds to the provided commitment.
+func gokzgVerifyCells(cells []Cell, commitments []Commitment, cellProofs []Proof, cellIndices []uint64) error {
+	gokzgIniter.Do(gokzgInit)
+
+	var (
+		proofs   = make([]gokzg4844.KZGProof, len(cellProofs))
+		commits  = make([]gokzg4844.KZGCommitment, 0, len(cellProofs))
+		indices  = make([]uint64, 0, len(cellProofs))
+		kzgcells = make([]*gokzg4844.Cell, 0, len(cellProofs))
+	)
+	// Copy over the cell proofs and cells
+	for i := range cellProofs {
+		proofs[i] = gokzg4844.KZGProof(cellProofs[i])
+		gc := gokzg4844.Cell(cells[i])
+		kzgcells = append(kzgcells, &gc)
+	}
+	cellCounts := len(cellProofs) / len(commitments)
+	// Blow up the commitments to be the same length as the proofs
+	for _, commitment := range commitments {
+		for j := 0; j < cellCounts; j++ {
+			commits = append(commits, gokzg4844.KZGCommitment(commitment))
+		}
+	}
+	for j := 0; j < len(commitments); j++ {
+		indices = append(indices, cellIndices...)
+	}
+
+	return context.VerifyCellKZGProofBatch(commits, indices, kzgcells, proofs)
+}
+
+// gokzgComputeCells computes cells from blobs.
+func gokzgComputeCells(blobs []Blob) ([]Cell, error) {
+	gokzgIniter.Do(gokzgInit)
+	cells := make([]Cell, 0, gokzg4844.CellsPerExtBlob*len(blobs))
+
+	for i := range blobs {
+		cellsI, err := context.ComputeCells((*gokzg4844.Blob)(&blobs[i]), 2)
+		if err != nil {
+			return []Cell{}, err
+		}
+		for _, c := range cellsI {
+			if c != nil {
+				cells = append(cells, Cell(*c))
+			}
+		}
+	}
+	return cells, nil
+}
+
+// gokzgRecoverBlobs recovers blobs from cells and cell indices.
+func gokzgRecoverBlobs(cells []Cell, cellIndices []uint64) ([]Blob, error) {
+	gokzgIniter.Do(gokzgInit)
+
+	blobCount := len(cells) / len(cellIndices)
+	blobs := make([]Blob, 0, blobCount)
+
+	offset := 0
+	for range blobCount {
+		kzgcells := make([]*gokzg4844.Cell, 0, len(cellIndices))
+
+		for _, cell := range cells[offset : offset+len(cellIndices)] {
+			gc := gokzg4844.Cell(cell)
+			kzgcells = append(kzgcells, &gc)
+		}
+
+		extCells, err := context.RecoverCells(cellIndices, kzgcells, 2)
+		if err != nil {
+			return []Blob{}, err
+		}
+
+		var blob Blob
+		for i, cell := range extCells[:DataPerBlob] {
+			copy(blob[i*len(cell):], cell[:])
+		}
+		blobs = append(blobs, blob)
+
+		offset = offset + len(cellIndices)
+	}
+
+	return blobs, nil
 }

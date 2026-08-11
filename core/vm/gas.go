@@ -24,6 +24,7 @@ import (
 const (
 	GasQuickStep   uint64 = 2
 	GasFastestStep uint64 = 3
+	GasFastishStep uint64 = 4
 	GasFastStep    uint64 = 5
 	GasMidStep     uint64 = 8
 	GasSlowStep    uint64 = 10
@@ -48,6 +49,5 @@ func callGas(isEip150 bool, availableGas, base uint64, callCost *uint256.Int) (u
 	if !callCost.IsUint64() {
 		return 0, ErrGasUintOverflow
 	}
-
 	return callCost.Uint64(), nil
 }

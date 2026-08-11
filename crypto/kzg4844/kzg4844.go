@@ -21,20 +21,79 @@ import (
 	"embed"
 	"errors"
 	"hash"
+	"reflect"
 	"sync/atomic"
+
+	"github.com/ethereum/go-ethereum/common/hexutil"
 )
 
 //go:embed trusted_setup.json
 var content embed.FS
 
+var (
+	blobT       = reflect.TypeFor[Blob]()
+	commitmentT = reflect.TypeFor[Commitment]()
+	proofT      = reflect.TypeFor[Proof]()
+	cellT       = reflect.TypeFor[Cell]()
+)
+
+const (
+	CellProofsPerBlob = 128
+	CellsPerBlob      = 128
+	DataPerBlob       = 64
+)
+
+// Cell represents a single cell in a blob.
+type Cell [2048]byte
+
+// UnmarshalJSON parses a cell in hex syntax.
+func (c *Cell) UnmarshalJSON(input []byte) error {
+	return hexutil.UnmarshalFixedJSON(cellT, input, c[:])
+}
+
+// MarshalText returns the hex representation of c.
+func (c *Cell) MarshalText() ([]byte, error) {
+	return hexutil.Bytes(c[:]).MarshalText()
+}
+
 // Blob represents a 4844 data blob.
 type Blob [131072]byte
+
+// UnmarshalJSON parses a blob in hex syntax.
+func (b *Blob) UnmarshalJSON(input []byte) error {
+	return hexutil.UnmarshalFixedJSON(blobT, input, b[:])
+}
+
+// MarshalText returns the hex representation of b.
+func (b *Blob) MarshalText() ([]byte, error) {
+	return hexutil.Bytes(b[:]).MarshalText()
+}
 
 // Commitment is a serialized commitment to a polynomial.
 type Commitment [48]byte
 
+// UnmarshalJSON parses a commitment in hex syntax.
+func (c *Commitment) UnmarshalJSON(input []byte) error {
+	return hexutil.UnmarshalFixedJSON(commitmentT, input, c[:])
+}
+
+// MarshalText returns the hex representation of c.
+func (c Commitment) MarshalText() ([]byte, error) {
+	return hexutil.Bytes(c[:]).MarshalText()
+}
+
 // Proof is a serialized commitment to the quotient polynomial.
 type Proof [48]byte
+
+// UnmarshalJSON parses a proof in hex syntax.
+func (p *Proof) UnmarshalJSON(input []byte) error {
+	return hexutil.UnmarshalFixedJSON(proofT, input, p[:])
+}
+
+// MarshalText returns the hex representation of p.
+func (p Proof) MarshalText() ([]byte, error) {
+	return hexutil.Bytes(p[:]).MarshalText()
+}
 
 // Point is a BLS field element.
 type Point [32]byte
@@ -46,7 +105,7 @@ type Claim [32]byte
 var useCKZG atomic.Bool
 
 // UseCKZG can be called to switch the default Go implementation of KZG to the C
-// library if fo some reason the user wishes to do so (e.g. consensus bug in one
+// library if for some reason the user wishes to do so (e.g. consensus bug in one
 // or the other).
 func UseCKZG(use bool) error {
 	if use && !ckzgAvailable {
@@ -66,7 +125,7 @@ func UseCKZG(use bool) error {
 }
 
 // BlobToCommitment creates a small commitment out of a data blob.
-func BlobToCommitment(blob Blob) (Commitment, error) {
+func BlobToCommitment(blob *Blob) (Commitment, error) {
 	if useCKZG.Load() {
 		return ckzgBlobToCommitment(blob)
 	}
@@ -75,7 +134,7 @@ func BlobToCommitment(blob Blob) (Commitment, error) {
 
 // ComputeProof computes the KZG proof at the given point for the polynomial
 // represented by the blob.
-func ComputeProof(blob Blob, point Point) (Proof, Claim, error) {
+func ComputeProof(blob *Blob, point Point) (Proof, Claim, error) {
 	if useCKZG.Load() {
 		return ckzgComputeProof(blob, point)
 	}
@@ -95,7 +154,7 @@ func VerifyProof(commitment Commitment, point Point, claim Claim, proof Proof) e
 // the commitment.
 //
 // This method does not verify that the commitment is correct with respect to blob.
-func ComputeBlobProof(blob Blob, commitment Commitment) (Proof, error) {
+func ComputeBlobProof(blob *Blob, commitment Commitment) (Proof, error) {
 	if useCKZG.Load() {
 		return ckzgComputeBlobProof(blob, commitment)
 	}
@@ -103,11 +162,32 @@ func ComputeBlobProof(blob Blob, commitment Commitment) (Proof, error) {
 }
 
 // VerifyBlobProof verifies that the blob data corresponds to the provided commitment.
-func VerifyBlobProof(blob Blob, commitment Commitment, proof Proof) error {
+func VerifyBlobProof(blob *Blob, commitment Commitment, proof Proof) error {
 	if useCKZG.Load() {
 		return ckzgVerifyBlobProof(blob, commitment, proof)
 	}
 	return gokzgVerifyBlobProof(blob, commitment, proof)
+}
+
+// VerifyCellProofs verifies a batch of proofs corresponding to the blobs and commitments.
+// Expects length of blobs and commitments to be equal.
+// Expects length of proofs be 128 * length of blobs.
+func VerifyCellProofs(blobs []Blob, commitments []Commitment, proofs []Proof) error {
+	if useCKZG.Load() {
+		return ckzgVerifyCellProofBatch(blobs, commitments, proofs)
+	}
+	return gokzgVerifyCellProofBatch(blobs, commitments, proofs)
+}
+
+// ComputeCellProofs returns the KZG cell proofs that are used to verify the blob against
+// the commitment.
+//
+// This method does not verify that the commitment is correct with respect to blob.
+func ComputeCellProofs(blob *Blob) ([]Proof, error) {
+	if useCKZG.Load() {
+		return ckzgComputeCellProofs(blob)
+	}
+	return gokzgComputeCellProofs(blob)
 }
 
 // CalcBlobHashV1 calculates the 'versioned blob hash' of a commitment.
@@ -126,4 +206,76 @@ func CalcBlobHashV1(hasher hash.Hash, commit *Commitment) (vh [32]byte) {
 // IsValidVersionedHash checks that h is a structurally-valid versioned blob hash.
 func IsValidVersionedHash(h []byte) bool {
 	return len(h) == 32 && h[0] == 0x01
+}
+
+// VerifyCells verifies a batch of proofs corresponding to the cells and blob commitments.
+//
+// For this function, it is sufficient to only provide some of the cells.
+//
+// The `cellIndices` specify which of the 128 cells of each blob are given.
+// Indices must be given in ascending order.
+//
+// Note the list of indices is shared among all blobs, i.e. for a given list of indices
+// [1, 2, 13], the cells slice must contain cells [1, 2, 13] of each blob.
+// Thus, `len(cells)` must be a multiple of `len(cellIndices)`.
+//
+// One proof must be given for each cell. As such, `len(proofs)` must equal `len(cells)`.
+func VerifyCells(cells []Cell, commitments []Commitment, proofs []Proof, cellIndices []uint64) error {
+	// commitments/proofs/cells validation
+	switch {
+	case len(commitments) == 0:
+		return errors.New("no commitments")
+	case len(proofs)%len(commitments) != 0:
+		return errors.New("len(proofs) must be a multiple of len(commitments)")
+	case len(cells) != len(proofs):
+		return errors.New("mismatched len(cellProofs) and len(cells)")
+	}
+	if err := validateCellIndices(cells, cellIndices); err != nil {
+		return err
+	}
+	if len(cells)/len(cellIndices) != len(commitments) {
+		return errors.New("invalid number of cells for blob count")
+	}
+
+	if useCKZG.Load() {
+		return ckzgVerifyCells(cells, commitments, proofs, cellIndices)
+	}
+	return gokzgVerifyCells(cells, commitments, proofs, cellIndices)
+}
+
+// ComputeCells computes the cells from the given blobs.
+func ComputeCells(blobs []Blob) ([]Cell, error) {
+	if useCKZG.Load() {
+		return ckzgComputeCells(blobs)
+	}
+	return gokzgComputeCells(blobs)
+}
+
+// RecoverBlobs recovers blobs from the given cells and cell indices.
+// In order to successfully recover, at least DataPerBlob (64) cells must be provided.
+//
+// For the layout of cells and cellIndices, please see [VerifyCells].
+func RecoverBlobs(cells []Cell, cellIndices []uint64) ([]Blob, error) {
+	if err := validateCellIndices(cells, cellIndices); err != nil {
+		return nil, err
+	}
+	if useCKZG.Load() {
+		return ckzgRecoverBlobs(cells, cellIndices)
+	}
+	return gokzgRecoverBlobs(cells, cellIndices)
+}
+
+func validateCellIndices(cells []Cell, cellIndices []uint64) error {
+	switch {
+	case len(cellIndices) == 0:
+		return errors.New("no cellIndices given")
+	case len(cellIndices) > len(cells):
+		return errors.New("less cells than cellIndices")
+	case len(cellIndices) > CellsPerBlob:
+		return errors.New("too many cellIndices")
+	case len(cells)%len(cellIndices) != 0:
+		return errors.New("len(cells) must be a multiple of len(cellIndices)")
+	}
+	// The library checks the canonical ordering of indices, so we don't have to do it here.
+	return nil
 }

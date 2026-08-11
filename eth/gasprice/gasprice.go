@@ -19,17 +19,19 @@ package gasprice
 import (
 	"context"
 	"math/big"
+	"slices"
 	"sync"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/lru"
 	"github.com/ethereum/go-ethereum/core"
+	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/event"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rpc"
-	"golang.org/x/exp/slices"
+	"github.com/holiman/uint256"
 )
 
 const sampleNumber = 3 // Number of transactions sampled in a block
@@ -44,7 +46,6 @@ type Config struct {
 	Percentile       int
 	MaxHeaderHistory uint64
 	MaxBlockHistory  uint64
-	Default          *big.Int `toml:",omitempty"`
 	MaxPrice         *big.Int `toml:",omitempty"`
 	IgnorePrice      *big.Int `toml:",omitempty"`
 }
@@ -54,7 +55,7 @@ type OracleBackend interface {
 	HeaderByNumber(ctx context.Context, number rpc.BlockNumber) (*types.Header, error)
 	BlockByNumber(ctx context.Context, number rpc.BlockNumber) (*types.Block, error)
 	GetReceipts(ctx context.Context, hash common.Hash) (types.Receipts, error)
-	PendingBlockAndReceipts() (*types.Block, types.Receipts)
+	Pending() (*types.Block, types.Receipts, *state.StateDB)
 	ChainConfig() *params.ChainConfig
 	SubscribeChainHeadEvent(ch chan<- core.ChainHeadEvent) event.Subscription
 }
@@ -78,7 +79,7 @@ type Oracle struct {
 
 // NewOracle returns a new gasprice oracle which can recommend suitable
 // gasprice for newly created transaction.
-func NewOracle(backend OracleBackend, params Config) *Oracle {
+func NewOracle(backend OracleBackend, params Config, startPrice *big.Int) *Oracle {
 	blocks := params.Blocks
 	if blocks < 1 {
 		blocks = 1
@@ -114,23 +115,33 @@ func NewOracle(backend OracleBackend, params Config) *Oracle {
 		maxBlockHistory = 1
 		log.Warn("Sanitizing invalid gasprice oracle max block history", "provided", params.MaxBlockHistory, "updated", maxBlockHistory)
 	}
+	if startPrice == nil {
+		startPrice = new(big.Int)
+	}
 
 	cache := lru.NewCache[cacheKey, processedFees](2048)
 	headEvent := make(chan core.ChainHeadEvent, 1)
-	backend.SubscribeChainHeadEvent(headEvent)
-	go func() {
-		var lastHead common.Hash
-		for ev := range headEvent {
-			if ev.Block.ParentHash() != lastHead {
-				cache.Purge()
+	sub := backend.SubscribeChainHeadEvent(headEvent)
+	if sub != nil { // the gasprice testBackend doesn't support subscribing to head events
+		go func() {
+			var lastHead common.Hash
+			for {
+				select {
+				case ev := <-headEvent:
+					if ev.Header.ParentHash != lastHead {
+						cache.Purge()
+					}
+					lastHead = ev.Header.Hash()
+				case <-sub.Err():
+					return
+				}
 			}
-			lastHead = ev.Block.Hash()
-		}
-	}()
+		}()
+	}
 
 	return &Oracle{
 		backend:          backend,
-		lastPrice:        params.Default,
+		lastPrice:        startPrice,
 		maxPrice:         maxPrice,
 		ignorePrice:      ignorePrice,
 		checkBlocks:      blocks,
@@ -247,12 +258,12 @@ func (oracle *Oracle) getBlockValues(ctx context.Context, blockNum uint64, limit
 	sortedTxs := make([]*types.Transaction, len(txs))
 	copy(sortedTxs, txs)
 	baseFee := block.BaseFee()
+	baseFee256 := new(uint256.Int)
+	if baseFee != nil {
+		baseFee256.SetFromBig(baseFee)
+	}
 	slices.SortFunc(sortedTxs, func(a, b *types.Transaction) int {
-		// It's okay to discard the error because a tx would never be
-		// accepted into a block with an invalid effective tip.
-		tip1, _ := a.EffectiveGasTip(baseFee)
-		tip2, _ := b.EffectiveGasTip(baseFee)
-		return tip1.Cmp(tip2)
+		return a.EffectiveGasTipCmp(b, baseFee256)
 	})
 
 	var prices []*big.Int

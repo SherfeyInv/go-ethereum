@@ -4,13 +4,14 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"math/big"
 	"reflect"
+	"slices"
 	"sync"
 	"time"
 
 	"github.com/holiman/uint256"
-	"golang.org/x/exp/slog"
 )
 
 type discardHandler struct{}
@@ -37,7 +38,7 @@ func (h *discardHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 }
 
 type TerminalHandler struct {
-	mu       sync.Mutex
+	mu       *sync.Mutex
 	wr       io.Writer
 	lvl      slog.Level
 	useColor bool
@@ -66,6 +67,7 @@ func NewTerminalHandler(wr io.Writer, useColor bool) *TerminalHandler {
 // records which are less than or equal to the specified verbosity level.
 func NewTerminalHandlerWithLevel(wr io.Writer, lvl slog.Level, useColor bool) *TerminalHandler {
 	return &TerminalHandler{
+		mu:           &sync.Mutex{},
 		wr:           wr,
 		lvl:          lvl,
 		useColor:     useColor,
@@ -77,9 +79,9 @@ func (h *TerminalHandler) Handle(_ context.Context, r slog.Record) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	buf := h.format(h.buf, r, h.useColor)
-	h.wr.Write(buf)
+	_, err := h.wr.Write(buf)
 	h.buf = buf[:0]
-	return nil
+	return err
 }
 
 func (h *TerminalHandler) Enabled(_ context.Context, level slog.Level) bool {
@@ -92,19 +94,20 @@ func (h *TerminalHandler) WithGroup(name string) slog.Handler {
 
 func (h *TerminalHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	return &TerminalHandler{
+		mu:           h.mu,
 		wr:           h.wr,
 		lvl:          h.lvl,
 		useColor:     h.useColor,
-		attrs:        append(h.attrs, attrs...),
+		attrs:        append(slices.Clone(h.attrs), attrs...),
 		fieldPadding: make(map[string]int),
 	}
 }
 
 // ResetFieldPadding zeroes the field-padding for all attribute pairs.
-func (t *TerminalHandler) ResetFieldPadding() {
-	t.mu.Lock()
-	t.fieldPadding = make(map[string]int)
-	t.mu.Unlock()
+func (h *TerminalHandler) ResetFieldPadding() {
+	h.mu.Lock()
+	h.fieldPadding = make(map[string]int)
+	h.mu.Unlock()
 }
 
 type leveler struct{ minLevel slog.Level }
@@ -115,8 +118,15 @@ func (l *leveler) Level() slog.Level {
 
 // JSONHandler returns a handler which prints records in JSON format.
 func JSONHandler(wr io.Writer) slog.Handler {
+	return JSONHandlerWithLevel(wr, levelMaxVerbosity)
+}
+
+// JSONHandlerWithLevel returns a handler which prints records in JSON format that are less than or equal to
+// the specified verbosity level.
+func JSONHandlerWithLevel(wr io.Writer, level slog.Level) slog.Handler {
 	return slog.NewJSONHandler(wr, &slog.HandlerOptions{
 		ReplaceAttr: builtinReplaceJSON,
+		Level:       &leveler{level},
 	})
 }
 

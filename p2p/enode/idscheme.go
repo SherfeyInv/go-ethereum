@@ -18,14 +18,14 @@ package enode
 
 import (
 	"crypto/ecdsa"
-	"fmt"
+	"errors"
 	"io"
 
 	"github.com/ethereum/go-ethereum/common/math"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/crypto/keccak"
 	"github.com/ethereum/go-ethereum/p2p/enr"
 	"github.com/ethereum/go-ethereum/rlp"
-	"golang.org/x/crypto/sha3"
 )
 
 // ValidSchemes is a List of known secure identity schemes.
@@ -49,7 +49,7 @@ func SignV4(r *enr.Record, privkey *ecdsa.PrivateKey) error {
 	cpy.Set(enr.ID("v4"))
 	cpy.Set(Secp256k1(privkey.PublicKey))
 
-	h := sha3.NewLegacyKeccak256()
+	h := keccak.NewLegacyKeccak256()
 	rlp.Encode(h, cpy.AppendElements(nil))
 	sig, err := crypto.Sign(h.Sum(nil), privkey)
 	if err != nil {
@@ -67,10 +67,10 @@ func (V4ID) Verify(r *enr.Record, sig []byte) error {
 	if err := r.Load(&entry); err != nil {
 		return err
 	} else if len(entry) != 33 {
-		return fmt.Errorf("invalid public key")
+		return errors.New("invalid public key")
 	}
 
-	h := sha3.NewLegacyKeccak256()
+	h := keccak.NewLegacyKeccak256()
 	rlp.Encode(h, r.AppendElements(nil))
 	if !crypto.VerifySignature(entry, h.Sum(nil), sig) {
 		return enr.ErrInvalidSig
@@ -157,5 +157,5 @@ func SignNull(r *enr.Record, id ID) *Node {
 	if err := r.SetSig(NullID{}, []byte{}); err != nil {
 		panic(err)
 	}
-	return &Node{r: *r, id: id}
+	return newNodeWithID(r, id)
 }

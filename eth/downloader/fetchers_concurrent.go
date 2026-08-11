@@ -76,7 +76,7 @@ type typedQueue interface {
 // concurrentFetch iteratively downloads scheduled block parts, taking available
 // peers, reserving a chunk of fetch requests for each and waiting for delivery
 // or timeouts.
-func (d *Downloader) concurrentFetch(queue typedQueue, beaconMode bool) error {
+func (d *Downloader) concurrentFetch(queue typedQueue) error {
 	// Create a delivery channel to accept responses from all peers
 	responses := make(chan *eth.Response)
 
@@ -126,10 +126,6 @@ func (d *Downloader) concurrentFetch(queue typedQueue, beaconMode bool) error {
 	// Prepare the queue and fetch block parts until the block header fetcher's done
 	finished := false
 	for {
-		// Short circuit if we lost all our peers
-		if d.peers.Len() == 0 && !beaconMode {
-			return errNoPeers
-		}
 		// If there's nothing more to fetch, wait or terminate
 		if queue.pending() == 0 {
 			if len(pending) == 0 && finished {
@@ -158,27 +154,20 @@ func (d *Downloader) concurrentFetch(queue typedQueue, beaconMode bool) error {
 			}
 			sort.Sort(&peerCapacitySort{idles, caps})
 
-			var (
-				progressed bool
-				throttled  bool
-				queued     = queue.pending()
-			)
+			var throttled bool
 			for _, peer := range idles {
 				// Short circuit if throttling activated or there are no more
 				// queued tasks to be retrieved
 				if throttled {
 					break
 				}
-				if queued = queue.pending(); queued == 0 {
+				if queued := queue.pending(); queued == 0 {
 					break
 				}
 				// Reserve a chunk of fetches for a peer. A nil can mean either that
 				// no more headers are available, or that the peer is known not to
 				// have them.
-				request, progress, throttle := queue.reserve(peer, queue.capacity(peer, d.peers.rates.TargetRoundTrip()))
-				if progress {
-					progressed = true
-				}
+				request, _, throttle := queue.reserve(peer, queue.capacity(peer, d.peers.rates.TargetRoundTrip()))
 				if throttle {
 					throttled = true
 					throttleCounter.Inc(1)
@@ -206,11 +195,6 @@ func (d *Downloader) concurrentFetch(queue typedQueue, beaconMode bool) error {
 				if timeouts.Size() == 1 {
 					timeout.Reset(ttl)
 				}
-			}
-			// Make sure that we have peers available for fetching. If all peers have been tried
-			// and all failed throw an error
-			if !progressed && !throttled && len(pending) == 0 && len(idles) == d.peers.Len() && queued > 0 && !beaconMode {
-				return errPeersUnavailable
 			}
 		}
 		// Wait for something to happen
@@ -315,16 +299,6 @@ func (d *Downloader) concurrentFetch(queue typedQueue, beaconMode bool) error {
 				queue.updateCapacity(peer, 0, 0)
 			} else {
 				d.dropPeer(peer.id)
-
-				// If this peer was the master peer, abort sync immediately
-				d.cancelLock.RLock()
-				master := peer.id == d.cancelPeer
-				d.cancelLock.RUnlock()
-
-				if master {
-					d.cancel()
-					return errTimeout
-				}
 			}
 
 		case res := <-responses:
@@ -349,25 +323,32 @@ func (d *Downloader) concurrentFetch(queue typedQueue, beaconMode bool) error {
 			delete(pending, res.Req.Peer)
 			delete(stales, res.Req.Peer)
 
-			// Signal the dispatcher that the round trip is done. We'll drop the
-			// peer if the data turns out to be junk.
-			res.Done <- nil
-			res.Req.Close()
-
 			// If the peer was previously banned and failed to deliver its pack
 			// in a reasonable time frame, ignore its message.
-			if peer := d.peers.Peer(res.Req.Peer); peer != nil {
-				// Deliver the received chunk of data and check chain validity
-				accepted, err := queue.deliver(peer, res)
-				if errors.Is(err, errInvalidChain) {
-					return err
-				}
-				// Unless a peer delivered something completely else than requested (usually
-				// caused by a timed out request which came through in the end), set it to
-				// idle. If the delivery's stale, the peer should have already been idled.
-				if !errors.Is(err, errStaleDelivery) {
-					queue.updateCapacity(peer, accepted, res.Time)
-				}
+			peer := d.peers.Peer(res.Req.Peer)
+			if peer == nil {
+				res.Done <- nil
+				res.Req.Close()
+				continue
+			}
+			// Deliver the received chunk of data and check chain validity
+			accepted, err := queue.deliver(peer, res)
+			// Unless a peer delivered something completely else than requested (usually
+			// caused by a timed out request which came through in the end), set it to
+			// idle. If the delivery's stale, the peer should have already been idled.
+			if !errors.Is(err, errStaleDelivery) {
+				queue.updateCapacity(peer, accepted, res.Time)
+			}
+			res.Done <- validityErrorOfRequest(err)
+			res.Req.Close()
+
+			if errors.Is(err, errInvalidChain) {
+				// errInvalidChain is the signal that processing of items failed internally,
+				// even though the items were validly encoded.
+				//
+				// This can be due to invalid blocks, or a database error.
+				// The sync cycle should be aborted for such errors, so we return it here.
+				return err
 			}
 
 		case cont := <-queue.waker():
@@ -377,4 +358,12 @@ func (d *Downloader) concurrentFetch(queue typedQueue, beaconMode bool) error {
 			}
 		}
 	}
+}
+
+// validityErrorOfRequest returns err if it is related to block validity, and nil otherwise.
+func validityErrorOfRequest(err error) error {
+	if errors.Is(err, errInvalidBody) || errors.Is(err, errInvalidReceipt) || errors.Is(err, errInvalidBAL) {
+		return err
+	}
+	return nil
 }

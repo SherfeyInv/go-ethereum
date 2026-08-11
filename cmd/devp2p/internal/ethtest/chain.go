@@ -24,10 +24,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math/big"
 	"os"
-	"path"
-	"sort"
+	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -40,7 +41,6 @@ import (
 	"github.com/ethereum/go-ethereum/eth/protocols/eth"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
-	"golang.org/x/exp/slices"
 )
 
 // Chain is a lightweight blockchain-like store which can read a hivechain
@@ -51,35 +51,49 @@ type Chain struct {
 	state   map[common.Address]state.DumpAccount // state of head block
 	senders map[common.Address]*senderInfo
 	config  *params.ChainConfig
+
+	txInfo txInfo
+}
+
+type txInfo struct {
+	LargeReceiptBlock *uint64 `json:"tx-largereceipt"`
 }
 
 // NewChain takes the given chain.rlp file, and decodes and returns
 // the blocks from the file.
 func NewChain(dir string) (*Chain, error) {
-	gen, err := loadGenesis(path.Join(dir, "genesis.json"))
+	gen, err := loadGenesis(filepath.Join(dir, "genesis.json"))
 	if err != nil {
 		return nil, err
 	}
 	gblock := gen.ToBlock()
 
-	blocks, err := blocksFromFile(path.Join(dir, "chain.rlp"), gblock)
+	blocks, err := blocksFromFile(filepath.Join(dir, "chain.rlp"), gblock)
 	if err != nil {
 		return nil, err
 	}
-	state, err := readState(path.Join(dir, "headstate.json"))
+	state, err := readState(filepath.Join(dir, "headstate.json"))
 	if err != nil {
 		return nil, err
 	}
-	accounts, err := readAccounts(path.Join(dir, "accounts.json"))
+	accounts, err := readAccounts(filepath.Join(dir, "accounts.json"))
 	if err != nil {
 		return nil, err
 	}
+
+	var txInfo txInfo
+	err = common.LoadJSON(filepath.Join(dir, "txinfo.json"), &txInfo)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Chain{
 		genesis: gen,
 		blocks:  blocks,
 		state:   state,
 		senders: accounts,
 		config:  gen.Config,
+		txInfo:  txInfo,
 	}, nil
 }
 
@@ -100,7 +114,6 @@ func (c *Chain) AccountsInHashOrder() []state.DumpAccount {
 	list := make([]state.DumpAccount, len(c.state))
 	i := 0
 	for addr, acc := range c.state {
-		addr := addr
 		list[i] = acc
 		list[i].Address = &addr
 		if len(acc.AddressHash) != 32 {
@@ -144,11 +157,7 @@ func (c *Chain) ForkID() forkid.ID {
 // TD calculates the total difficulty of the chain at the
 // chain head.
 func (c *Chain) TD() *big.Int {
-	sum := new(big.Int)
-	for _, block := range c.blocks[:c.Len()] {
-		sum.Add(sum, block.Difficulty())
-	}
-	return sum
+	return new(big.Int)
 }
 
 // GetBlock returns the block at the specified number.
@@ -167,11 +176,8 @@ func (c *Chain) RootAt(height int) common.Hash {
 // GetSender returns the address associated with account at the index in the
 // pre-funded accounts list.
 func (c *Chain) GetSender(idx int) (common.Address, uint64) {
-	var accounts Addresses
-	for addr := range c.senders {
-		accounts = append(accounts, addr)
-	}
-	sort.Sort(accounts)
+	accounts := slices.SortedFunc(maps.Keys(c.senders), common.Address.Cmp)
+
 	addr := accounts[idx]
 	return addr, c.senders[addr].Nonce
 }
@@ -225,7 +231,7 @@ func (c *Chain) GetHeaders(req *eth.GetBlockHeadersPacket) ([]*types.Header, err
 	}
 	if req.Reverse {
 		for i := 1; i < int(req.Amount); i++ {
-			blockNumber -= (1 - req.Skip)
+			blockNumber -= (1 + req.Skip)
 			headers[i] = c.blocks[blockNumber].Header()
 		}
 		return headers, nil
@@ -259,22 +265,6 @@ func loadGenesis(genesisFile string) (core.Genesis, error) {
 		return core.Genesis{}, err
 	}
 	return gen, nil
-}
-
-type Addresses []common.Address
-
-func (a Addresses) Len() int {
-	return len(a)
-}
-
-func (a Addresses) Less(i, j int) bool {
-	return bytes.Compare(a[i][:], a[j][:]) < 0
-}
-
-func (a Addresses) Swap(i, j int) {
-	tmp := a[i]
-	a[i] = a[j]
-	a[j] = tmp
 }
 
 func blocksFromFile(chainfile string, gblock *types.Block) ([]*types.Block, error) {
@@ -345,7 +335,7 @@ func readAccounts(file string) (map[common.Address]*senderInfo, error) {
 	for addr, acc := range keys {
 		pk, err := crypto.HexToECDSA(common.Bytes2Hex(acc.Key))
 		if err != nil {
-			return nil, fmt.Errorf("unable to read private key for %s: %v", err, addr)
+			return nil, fmt.Errorf("unable to read private key for %s: %v", addr, err)
 		}
 		accounts[addr] = &senderInfo{Key: pk, Nonce: 0}
 	}

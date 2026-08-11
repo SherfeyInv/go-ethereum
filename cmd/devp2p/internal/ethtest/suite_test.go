@@ -20,7 +20,7 @@ import (
 	crand "crypto/rand"
 	"fmt"
 	"os"
-	"path"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -34,12 +34,12 @@ import (
 	"github.com/ethereum/go-ethereum/p2p"
 )
 
-func makeJWTSecret() (string, [32]byte, error) {
+func makeJWTSecret(t *testing.T) (string, [32]byte, error) {
 	var secret [32]byte
 	if _, err := crand.Read(secret[:]); err != nil {
 		return "", secret, fmt.Errorf("failed to create jwt secret: %v", err)
 	}
-	jwtPath := path.Join(os.TempDir(), "jwt_secret")
+	jwtPath := filepath.Join(t.TempDir(), "jwt_secret")
 	if err := os.WriteFile(jwtPath, []byte(hexutil.Encode(secret[:])), 0600); err != nil {
 		return "", secret, fmt.Errorf("failed to prepare jwt secret file: %v", err)
 	}
@@ -47,7 +47,7 @@ func makeJWTSecret() (string, [32]byte, error) {
 }
 
 func TestEthSuite(t *testing.T) {
-	jwtPath, secret, err := makeJWTSecret()
+	jwtPath, secret, err := makeJWTSecret(t)
 	if err != nil {
 		t.Fatalf("could not make jwt secret: %v", err)
 	}
@@ -75,7 +75,7 @@ func TestEthSuite(t *testing.T) {
 }
 
 func TestSnapSuite(t *testing.T) {
-	jwtPath, secret, err := makeJWTSecret()
+	jwtPath, secret, err := makeJWTSecret(t)
 	if err != nil {
 		t.Fatalf("could not make jwt secret: %v", err)
 	}
@@ -90,6 +90,31 @@ func TestSnapSuite(t *testing.T) {
 		t.Fatalf("could not create new test suite: %v", err)
 	}
 	for _, test := range suite.SnapTests() {
+		t.Run(test.Name, func(t *testing.T) {
+			result := utesting.RunTests([]utesting.Test{{Name: test.Name, Fn: test.Fn}}, os.Stdout)
+			if result[0].Failed {
+				t.Fatal()
+			}
+		})
+	}
+}
+
+func TestSnap2Suite(t *testing.T) {
+	jwtPath, secret, err := makeJWTSecret(t)
+	if err != nil {
+		t.Fatalf("could not make jwt secret: %v", err)
+	}
+	geth, err := runGeth("./testdata", jwtPath)
+	if err != nil {
+		t.Fatalf("could not run geth: %v", err)
+	}
+	defer geth.Close()
+
+	suite, err := NewSuite(geth.Server().Self(), "./testdata", geth.HTTPAuthEndpoint(), common.Bytes2Hex(secret[:]))
+	if err != nil {
+		t.Fatalf("could not create new test suite: %v", err)
+	}
+	for _, test := range suite.Snap2Tests() {
 		t.Run(test.Name, func(t *testing.T) {
 			result := utesting.RunTests([]utesting.Test{{Name: test.Name, Fn: test.Fn}}, os.Stdout)
 			if result[0].Failed {
@@ -141,6 +166,7 @@ func setupGeth(stack *node.Node, dir string) error {
 		TrieDirtyCache: 16,
 		TrieTimeout:    60 * time.Minute,
 		SnapshotCache:  10,
+		SnapV2:         true, // advertise snap/2 (alongside snap/1) so the snap/2 suite can negotiate it
 	})
 	if err != nil {
 		return err

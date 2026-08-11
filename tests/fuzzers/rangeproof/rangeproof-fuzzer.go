@@ -21,17 +21,17 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"slices"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/ethdb/memorydb"
 	"github.com/ethereum/go-ethereum/trie"
-	"golang.org/x/exp/slices"
+	"github.com/ethereum/go-ethereum/triedb"
 )
 
 type kv struct {
 	k, v []byte
-	t    bool
 }
 
 type fuzzer struct {
@@ -56,13 +56,13 @@ func (f *fuzzer) readInt() uint64 {
 }
 
 func (f *fuzzer) randomTrie(n int) (*trie.Trie, map[string]*kv) {
-	trie := trie.NewEmpty(trie.NewDatabase(rawdb.NewMemoryDatabase(), nil))
+	trie := trie.NewEmpty(triedb.NewDatabase(rawdb.NewMemoryDatabase(), nil))
 	vals := make(map[string]*kv)
 	size := f.readInt()
 	// Fill it with some fluff
 	for i := byte(0); i < byte(size); i++ {
-		value := &kv{common.LeftPadBytes([]byte{i}, 32), []byte{i}, false}
-		value2 := &kv{common.LeftPadBytes([]byte{i + 10}, 32), []byte{i}, false}
+		value := &kv{common.LeftPadBytes([]byte{i}, 32), []byte{i}}
+		value2 := &kv{common.LeftPadBytes([]byte{i + 10}, 32), []byte{i}}
 		trie.MustUpdate(value.k, value.v)
 		trie.MustUpdate(value2.k, value2.v)
 		vals[string(value.k)] = value
@@ -75,7 +75,7 @@ func (f *fuzzer) randomTrie(n int) (*trie.Trie, map[string]*kv) {
 	for i := 0; i < n; i++ {
 		k := f.randBytes(32)
 		v := f.randBytes(20)
-		value := &kv{k, v, false}
+		value := &kv{k, v}
 		trie.MustUpdate(k, v)
 		vals[string(k)] = value
 		if f.exhausted {
